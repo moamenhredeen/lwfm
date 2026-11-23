@@ -1,5 +1,6 @@
-//! Keymap: (scope, chord) -> command. Lookup walks from the focused scope up
-//! to `Global`. The default table is shaped like the future Lua keymap.
+//! Keymap: per-scope tries of key sequences -> actions. Lookup walks a scope
+//! chain (e.g. search -> list -> global) and reports a match, a pending
+//! prefix with hints for the next chord, or nothing.
 
 use std::collections::HashMap;
 
@@ -10,68 +11,198 @@ use crate::cmd::registry::{self, Invocation};
 pub enum Scope {
     Global,
     List,
+    Search,
     Input,
 }
 
 impl Scope {
-    fn parent(self) -> Option<Scope> {
+    pub const NAMES: &'static [&'static str] = &["global", "list", "search", "input"];
+
+    pub fn from_name(s: &str) -> Option<Scope> {
+        Some(match s {
+            "global" => Scope::Global,
+            "list" => Scope::List,
+            "search" => Scope::Search,
+            "input" => Scope::Input,
+            _ => return None,
+        })
+    }
+
+    pub fn name(self) -> &'static str {
         match self {
-            Scope::List | Scope::Input => Some(Scope::Global),
-            Scope::Global => None,
+            Scope::Global => "global",
+            Scope::List => "list",
+            Scope::Search => "search",
+            Scope::Input => "input",
         }
     }
 }
 
-pub const DEFAULT_KEYMAP: &[(Scope, &str, &str)] = &[
-    (Scope::Global, "ctrl+q", "quit"),
-    (Scope::Global, "ctrl+l", "focus-path"),
-    (Scope::Global, "alt+d", "focus-path"),
-    (Scope::Global, "f4", "focus-path"),
-    (Scope::Global, "alt+left", "back"),
-    (Scope::Global, "alt+right", "forward"),
-    (Scope::Global, "alt+up", "up"),
-    (Scope::Global, "f5", "refresh"),
-    (Scope::Global, "ctrl+r", "refresh"),
-    (Scope::Global, "ctrl+h", "toggle-hidden"),
-    (Scope::List, "enter", "open"),
-    (Scope::List, "backspace", "up"),
-    (Scope::Input, "enter", "path-submit"),
-    (Scope::Input, "esc", "path-cancel"),
-];
+pub enum Action {
+    /// Command strings compiled at load, run in order until one fails.
+    Commands(Vec<Invocation>),
+    Lua(mlua::Function),
+}
 
-#[derive(Default, Debug)]
+pub struct Binding {
+    pub action: Action,
+    /// Text shown in the hint bar: the `desc`, or the command text.
+    pub label: String,
+}
+
+impl Binding {
+    pub fn commands(cmds: &[&str], desc: Option<&str>) -> Result<Binding, String> {
+        let invs = cmds
+            .iter()
+            .map(|c| registry::compile(c).map_err(|e| e.0))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Binding {
+            action: Action::Commands(invs),
+            label: desc.map_or_else(|| cmds.join("; "), str::to_string),
+        })
+    }
+}
+
+/// One binding as written in a config layer. `binding: None` is `noop`.
+pub struct Entry {
+    pub scope: Scope,
+    pub keys: String,
+    pub seq: Vec<Chord>,
+    pub binding: Option<Binding>,
+}
+
+impl Entry {
+    pub fn new(scope: Scope, keys: &str, binding: Option<Binding>) -> Result<Entry, String> {
+        Ok(Entry {
+            scope,
+            keys: keys.to_string(),
+            seq: parse_seq(keys)?,
+            binding,
+        })
+    }
+}
+
+/// Parses `"ctrl+g d"` into chords.
+pub fn parse_seq(keys: &str) -> Result<Vec<Chord>, String> {
+    let seq = keys
+        .split_whitespace()
+        .map(|c| c.parse::<Chord>().map_err(|e| format!("`{keys}`: {e}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    if seq.is_empty() {
+        return Err("empty key text".into());
+    }
+    Ok(seq)
+}
+
+/// Rejects duplicates and prefix conflicts within one layer.
+fn check_layer(entries: &[Entry]) -> Result<(), String> {
+    for (i, a) in entries.iter().enumerate() {
+        for b in &entries[i + 1..] {
+            if a.scope != b.scope {
+                continue;
+            }
+            let scope = a.scope.name();
+            if a.seq == b.seq {
+                return Err(format!(
+                    "`{}` and `{}` are the same keys in {scope}",
+                    a.keys, b.keys
+                ));
+            }
+            let (short, long) = if a.seq.len() < b.seq.len() {
+                (a, b)
+            } else {
+                (b, a)
+            };
+            if long.seq.starts_with(&short.seq) {
+                return Err(format!(
+                    "`{}` is a prefix of `{}` in {scope}; a key sequence cannot also be a binding",
+                    short.keys, long.keys
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct Node {
+    binding: Option<Binding>,
+    children: HashMap<Chord, Node>,
+}
+
+pub enum Lookup<'a> {
+    Match(&'a Binding),
+    /// The keys so far start one or more sequences: (next chord, label).
+    Prefix(Vec<(String, String)>),
+    None,
+}
+
+#[derive(Default)]
 pub struct Keymap {
-    bindings: HashMap<(Scope, Chord), Invocation>,
+    scopes: HashMap<Scope, Node>,
 }
 
 impl Keymap {
-    /// Builds a keymap from (scope, chord text, command string) entries,
-    /// failing on the first invalid chord, invalid command or duplicate.
-    pub fn from_table(table: &[(Scope, &str, &str)]) -> Result<Keymap, String> {
-        let mut bindings = HashMap::new();
-        for &(scope, chord, command) in table {
-            let parsed: Chord = chord.parse().map_err(|e| format!("{e}"))?;
-            let inv = registry::compile(command).map_err(|e| format!("`{chord}`: {e}"))?;
-            if bindings.insert((scope, parsed), inv).is_some() {
-                return Err(format!("`{parsed}` is bound twice in {scope:?}"));
-            }
+    /// Merges the preset and user layers: a user binding replaces every
+    /// preset binding in the same scope that it equals, extends or prefixes.
+    pub fn build(preset: Vec<Entry>, user: Vec<Entry>) -> Result<Keymap, String> {
+        check_layer(&preset)?;
+        check_layer(&user)?;
+        let mut merged = preset;
+        for u in user {
+            merged.retain(|p| {
+                p.scope != u.scope || !(p.seq.starts_with(&u.seq) || u.seq.starts_with(&p.seq))
+            });
+            merged.push(u);
         }
-        Ok(Keymap { bindings })
+        let mut map = Keymap::default();
+        for e in merged {
+            let Some(binding) = e.binding else { continue };
+            let mut node = map.scopes.entry(e.scope).or_default();
+            for chord in e.seq {
+                node = node.children.entry(chord).or_default();
+            }
+            node.binding = Some(binding);
+        }
+        Ok(map)
     }
 
-    pub fn default_map() -> Keymap {
-        Keymap::from_table(DEFAULT_KEYMAP).expect("default keymap is valid")
-    }
-
-    pub fn lookup(&self, scope: Scope, chord: &Chord) -> Option<&Invocation> {
-        let mut s = Some(scope);
-        while let Some(scope) = s {
-            if let Some(inv) = self.bindings.get(&(scope, *chord)) {
-                return Some(inv);
+    pub fn lookup(&self, chain: &[Scope], seq: &[Chord]) -> Lookup<'_> {
+        for scope in chain {
+            let Some(mut node) = self.scopes.get(scope) else {
+                continue;
+            };
+            let mut found = true;
+            for chord in seq {
+                match node.children.get(chord) {
+                    Some(n) => node = n,
+                    None => {
+                        found = false;
+                        break;
+                    }
+                }
             }
-            s = scope.parent();
+            if !found || seq.is_empty() {
+                continue;
+            }
+            if let Some(b) = &node.binding {
+                return Lookup::Match(b);
+            }
+            let mut hints: Vec<(String, String)> = node
+                .children
+                .iter()
+                .map(|(c, n)| {
+                    let label = n
+                        .binding
+                        .as_ref()
+                        .map_or_else(|| "...".to_string(), |b| b.label.clone());
+                    (c.to_string(), label)
+                })
+                .collect();
+            hints.sort();
+            return Lookup::Prefix(hints);
         }
-        None
+        Lookup::None
     }
 }
 
@@ -79,31 +210,135 @@ impl Keymap {
 mod tests {
     use super::*;
 
-    fn name(km: &Keymap, scope: Scope, chord: &str) -> Option<&'static str> {
-        km.lookup(scope, &chord.parse().unwrap())
-            .map(|i| i.def.name)
+    fn cmd(scope: Scope, keys: &str, command: &str) -> Entry {
+        let b = (command != "noop").then(|| Binding::commands(&[command], None).unwrap());
+        Entry::new(scope, keys, b).unwrap()
+    }
+
+    fn seq(s: &str) -> Vec<Chord> {
+        parse_seq(s).unwrap()
+    }
+
+    fn matched(km: &Keymap, chain: &[Scope], keys: &str) -> Option<String> {
+        match km.lookup(chain, &seq(keys)) {
+            Lookup::Match(b) => Some(b.label.clone()),
+            _ => None,
+        }
+    }
+
+    const LIST: &[Scope] = &[Scope::List, Scope::Global];
+    const SEARCH: &[Scope] = &[Scope::Search, Scope::List, Scope::Global];
+    const INPUT: &[Scope] = &[Scope::Input, Scope::Global];
+
+    fn preset() -> Vec<Entry> {
+        vec![
+            cmd(Scope::Global, "ctrl+q", "quit"),
+            cmd(Scope::Global, "ctrl+h", "toggle-hidden"),
+            cmd(Scope::List, "backspace", "up"),
+            cmd(Scope::Search, "backspace", "search-next"),
+        ]
     }
 
     #[test]
-    fn default_keymap_parses_and_resolves() {
-        let km = Keymap::default_map();
-        assert_eq!(name(&km, Scope::List, "backspace"), Some("up"));
-        assert_eq!(name(&km, Scope::Input, "backspace"), None);
-        assert_eq!(name(&km, Scope::Input, "ctrl+q"), Some("quit"));
-        assert_eq!(name(&km, Scope::List, "enter"), Some("open"));
-        assert_eq!(name(&km, Scope::Input, "enter"), Some("path-submit"));
-        assert_eq!(name(&km, Scope::List, "alt+left"), Some("back"));
-        assert_eq!(name(&km, Scope::List, "down"), None);
+    fn scope_chain() {
+        let km = Keymap::build(preset(), vec![]).unwrap();
+        assert_eq!(matched(&km, LIST, "backspace").as_deref(), Some("up"));
+        assert_eq!(
+            matched(&km, SEARCH, "backspace").as_deref(),
+            Some("search-next")
+        );
+        assert_eq!(matched(&km, INPUT, "backspace"), None);
+        assert_eq!(matched(&km, INPUT, "ctrl+q").as_deref(), Some("quit"));
     }
 
     #[test]
-    fn rejects_bad_tables() {
-        assert!(Keymap::from_table(&[(Scope::List, "ctrl+foo", "up")]).is_err());
-        assert!(Keymap::from_table(&[(Scope::List, "x", "cpoy")]).is_err());
-        let dup = Keymap::from_table(&[
-            (Scope::List, "ctrl+x", "up"),
-            (Scope::List, "Ctrl+X", "back"),
-        ]);
-        assert!(dup.unwrap_err().contains("bound twice"));
+    fn sequences_and_hints() {
+        let user = vec![
+            Entry::new(
+                Scope::Global,
+                "ctrl+g d",
+                Some(Binding::commands(&["cd ~/Downloads"], Some("Downloads")).unwrap()),
+            )
+            .unwrap(),
+            Entry::new(
+                Scope::Global,
+                "ctrl+g p",
+                Some(Binding::commands(&["cd ~/projects"], Some("Projects")).unwrap()),
+            )
+            .unwrap(),
+        ];
+        let km = Keymap::build(preset(), user).unwrap();
+        match km.lookup(LIST, &seq("ctrl+g")) {
+            Lookup::Prefix(h) => assert_eq!(
+                h,
+                [
+                    ("d".into(), "Downloads".into()),
+                    ("p".into(), "Projects".into())
+                ]
+            ),
+            _ => panic!("expected prefix"),
+        }
+        assert_eq!(matched(&km, LIST, "ctrl+g d").as_deref(), Some("Downloads"));
+        assert!(matches!(km.lookup(LIST, &seq("ctrl+g x")), Lookup::None));
+    }
+
+    #[test]
+    fn user_overrides_and_noop() {
+        let user = vec![
+            cmd(Scope::Global, "ctrl+h", "refresh"),
+            cmd(Scope::List, "backspace", "noop"),
+        ];
+        let km = Keymap::build(preset(), user).unwrap();
+        assert_eq!(matched(&km, LIST, "ctrl+h").as_deref(), Some("refresh"));
+        assert_eq!(matched(&km, LIST, "backspace"), None);
+    }
+
+    #[test]
+    fn user_shadows_conflicting_preset_sequences() {
+        let user = vec![cmd(Scope::Global, "ctrl+h d", "cd ~/Downloads")];
+        let km = Keymap::build(preset(), user).unwrap();
+        assert!(matches!(km.lookup(LIST, &seq("ctrl+h")), Lookup::Prefix(_)));
+        let user = vec![cmd(Scope::Global, "ctrl+q", "refresh")];
+        let km = Keymap::build(vec![cmd(Scope::Global, "ctrl+q x", "quit")], user).unwrap();
+        assert_eq!(matched(&km, LIST, "ctrl+q").as_deref(), Some("refresh"));
+    }
+
+    #[test]
+    fn conflicts_within_user_layer() {
+        let dup = Keymap::build(
+            vec![],
+            vec![
+                cmd(Scope::List, "ctrl+x", "up"),
+                cmd(Scope::List, "Ctrl+X", "back"),
+            ],
+        );
+        assert!(dup.err().unwrap().contains("same keys"));
+        let prefix = Keymap::build(
+            vec![],
+            vec![
+                cmd(Scope::Global, "ctrl+g", "up"),
+                cmd(Scope::Global, "ctrl+g d", "back"),
+            ],
+        );
+        let err = prefix.err().unwrap();
+        assert!(err.contains("`ctrl+g` is a prefix of `ctrl+g d`"), "{err}");
+        // Same keys in different scopes are fine.
+        assert!(
+            Keymap::build(
+                vec![],
+                vec![
+                    cmd(Scope::List, "ctrl+x", "up"),
+                    cmd(Scope::Input, "ctrl+x", "back")
+                ]
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn invalid_keys_and_commands() {
+        assert!(Entry::new(Scope::List, "ctrl+foo", None).is_err());
+        assert!(Binding::commands(&["cpoy"], None).is_err());
+        assert!(parse_seq("  ").is_err());
     }
 }

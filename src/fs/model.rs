@@ -5,12 +5,13 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 
 use windows::Win32::Globalization::{
-    CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN, CompareStringEx, CompareStringOrdinal,
-    NORM_IGNORECASE, SORT_DIGITSASNUMBERS,
+    CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN, CompareStringEx, NORM_IGNORECASE,
+    SORT_DIGITSASNUMBERS,
 };
 use windows::core::PCWSTR;
 
 use super::entry::Entry;
+use crate::search::Query;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SortKey {
@@ -91,12 +92,6 @@ pub fn compare_names(a: &[u16], b: &[u16]) -> Ordering {
     }
 }
 
-/// Case-insensitive prefix test, used for type-to-find.
-pub fn has_prefix_ignore_case(name: &[u16], prefix: &[u16]) -> bool {
-    name.len() >= prefix.len()
-        && unsafe { CompareStringOrdinal(&name[..prefix.len()], prefix, true) } == CSTR_EQUAL
-}
-
 impl Model {
     pub fn clear(&mut self) {
         self.entries.clear();
@@ -140,6 +135,35 @@ impl Model {
                 if reverse { by_key.reverse() } else { by_key }
             })
         });
+    }
+
+    /// The next visible entry matching `q`: after `from` (wrapping around,
+    /// and finding `from` itself last), or the first from the top when
+    /// `from` is `None`. `forward = false` searches backwards.
+    pub fn next_match(&self, q: &Query, from: Option<usize>, forward: bool) -> Option<usize> {
+        let n = self.visible.len();
+        if n == 0 {
+            return None;
+        }
+        let matches = |i: usize| q.matches(&self.entry(i).unwrap().name);
+        match from {
+            None => (0..n).find(|&i| matches(i)),
+            Some(f) => (1..=n)
+                .map(|k| {
+                    if forward {
+                        (f + k) % n
+                    } else {
+                        (f + n - k % n) % n
+                    }
+                })
+                .find(|&i| matches(i)),
+        }
+    }
+
+    pub fn count_matches(&self, q: &Query) -> usize {
+        (0..self.visible.len())
+            .filter(|&i| q.matches(&self.entry(i).unwrap().name))
+            .count()
     }
 
     pub fn find(&self, name: &[u16]) -> Option<usize> {
@@ -201,6 +225,55 @@ mod tests {
         m.extend(entries);
         m.rebuild();
         m
+    }
+
+    fn search_fixture() -> Model {
+        model(vec![
+            file("report.pdf", 0, 0),
+            file("prep.txt", 0, 0),
+            dir("Reports"),
+            file("notes.md", 0, 0),
+        ])
+    }
+
+    #[test]
+    fn matches_do_not_filter() {
+        let m = search_fixture();
+        let q = Query::new("rep");
+        assert_eq!(names(&m), ["Reports", "notes.md", "prep.txt", "report.pdf"]);
+        assert_eq!(m.next_match(&q, None, true), Some(0));
+        assert_eq!(m.count_matches(&q), 3);
+        assert_eq!(m.next_match(&Query::new("PREP"), None, true), Some(2));
+        assert_eq!(m.next_match(&Query::new("zzz"), None, true), None);
+        assert_eq!(m.count_matches(&Query::new("zzz")), 0);
+    }
+
+    #[test]
+    fn next_and_previous_match_wrap() {
+        let m = search_fixture();
+        let q = Query::new("rep");
+        assert_eq!(m.next_match(&q, Some(0), true), Some(2));
+        assert_eq!(m.next_match(&q, Some(2), true), Some(3));
+        assert_eq!(m.next_match(&q, Some(3), true), Some(0));
+        assert_eq!(m.next_match(&q, Some(0), false), Some(3));
+        assert_eq!(m.next_match(&q, Some(2), false), Some(0));
+        // A single match finds itself again.
+        assert_eq!(m.next_match(&Query::new("notes"), Some(1), true), Some(1));
+    }
+
+    #[test]
+    fn hidden_entries_are_not_matched() {
+        let secret = Entry {
+            name: w("secret-report.txt"),
+            attrs: FILE_ATTRIBUTE_HIDDEN.0,
+            size: 0,
+            mtime: 0,
+        };
+        let mut m = model(vec![file("report.txt", 0, 0), secret]);
+        assert_eq!(m.count_matches(&Query::new("REPORT")), 1);
+        m.show_hidden = true;
+        m.rebuild();
+        assert_eq!(m.count_matches(&Query::new("REPORT")), 2);
     }
 
     #[test]
@@ -265,12 +338,5 @@ mod tests {
         assert_eq!(m.find(&w("x")), None);
         let set: HashSet<_> = [w("a"), w("c")].into_iter().collect();
         assert_eq!(m.find_all(&set), [0, 2]);
-    }
-
-    #[test]
-    fn prefix_match() {
-        assert!(has_prefix_ignore_case(&w("Documents"), &w("doc")));
-        assert!(!has_prefix_ignore_case(&w("Do"), &w("doc")));
-        assert!(!has_prefix_ignore_case(&w("Music"), &w("doc")));
     }
 }

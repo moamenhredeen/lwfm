@@ -1,5 +1,6 @@
 pub mod list;
 pub mod pathbar;
+pub mod searchbox;
 pub mod statusbar;
 pub mod window;
 

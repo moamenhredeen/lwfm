@@ -12,13 +12,14 @@ use windows::Win32::UI::Controls::{
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
-use super::{list, pathbar, statusbar};
-use crate::app::{App, Controls};
+use super::{list, pathbar, searchbox, statusbar};
+use crate::app::{App, Controls, Startup};
 
 const CLASS: PCWSTR = w!("lwfm.main");
 const ID_LIST: usize = 1;
 const ID_PATH: usize = 2;
 const ID_STATUS: usize = 3;
+const ID_SEARCH: usize = 4;
 
 thread_local! {
     static APP: RefCell<Option<Rc<App>>> = const { RefCell::new(None) };
@@ -38,7 +39,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 }
 
 /// Creates the window, runs the message loop and returns the exit code.
-pub fn run(start: Option<std::ffi::OsString>) -> windows::core::Result<i32> {
+pub fn run(mut startup: Startup) -> windows::core::Result<i32> {
     unsafe {
         let icc = INITCOMMONCONTROLSEX {
             dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
@@ -81,13 +82,14 @@ pub fn run(start: Option<std::ffi::OsString>) -> windows::core::Result<i32> {
             path: pathbar::create(hwnd, hinstance, ID_PATH)?,
             list: list::create(hwnd, hinstance, ID_LIST, dpi)?,
             status: statusbar::create(hwnd, hinstance, ID_STATUS)?,
+            search: searchbox::create(hwnd, hinstance, ID_SEARCH)?,
         };
 
-        let app = Rc::new(App::new(controls, dpi));
+        let app = Rc::new(App::new(controls, dpi, &mut startup));
         APP.with(|a| *a.borrow_mut() = Some(app.clone()));
         app.layout();
         let _ = ShowWindow(hwnd, SW_SHOWDEFAULT);
-        app.start(start);
+        app.start(&mut startup);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).0 > 0 {

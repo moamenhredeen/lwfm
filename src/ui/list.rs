@@ -1,6 +1,6 @@
 //! The virtual (owner-data) ListView showing the listing.
 
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND};
+use windows::Win32::Foundation::{HINSTANCE, HWND};
 use windows::Win32::UI::Controls::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, PWSTR, w};
@@ -13,17 +13,20 @@ pub const COLUMNS: [(&str, i32, bool); 3] = [
     ("Modified", 140, false),
 ];
 
-pub const DIR_COLOR: COLORREF = COLORREF(0x00B4_5F1A); // RGB(0x1A, 0x5F, 0xB4)
-pub const HIDDEN_COLOR: COLORREF = COLORREF(0x0080_8080);
-
 pub fn create(
     parent: HWND,
     hinstance: HINSTANCE,
     id: usize,
     dpi: u32,
 ) -> windows::core::Result<HWND> {
-    let style =
-        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | LVS_REPORT | LVS_OWNERDATA | LVS_SHOWSELALWAYS;
+    // Clip siblings so the search box shown over the list stays visible.
+    let style = WS_CHILD.0
+        | WS_VISIBLE.0
+        | WS_TABSTOP.0
+        | WS_CLIPSIBLINGS.0
+        | LVS_REPORT
+        | LVS_OWNERDATA
+        | LVS_SHOWSELALWAYS;
     let list = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -122,6 +125,23 @@ pub fn select(list: HWND, index: usize) {
 pub fn focus(list: HWND, index: usize) {
     set_state(list, index as isize, LVIS_FOCUSED, LVIS_FOCUSED);
     send(list, LVM_ENSUREVISIBLE, index, 0);
+}
+
+/// Makes `index` the only selected entry, focused and scrolled into view.
+pub fn select_only(list: HWND, index: usize) {
+    clear_selection(list);
+    select(list, index);
+    focus(list, index);
+}
+
+/// The rectangle of the Name text of row `index`.
+pub fn label_rect(list: HWND, index: usize) -> windows::Win32::Foundation::RECT {
+    let mut rc = windows::Win32::Foundation::RECT {
+        left: LVIR_LABEL as i32,
+        ..Default::default()
+    };
+    send(list, LVM_GETITEMRECT, index, &mut rc as *mut _ as isize);
+    rc
 }
 
 /// Rescales column widths after a DPI change, keeping user-resized widths.

@@ -39,10 +39,19 @@ pub trait Target {
     fn path_submit(&self) -> CmdResult;
     fn path_cancel(&self) -> CmdResult;
     fn quit(&self) -> CmdResult;
+    fn shell(&self, command: &str, console: bool) -> CmdResult;
+    fn search(&self, text: &str) -> CmdResult;
+    fn search_next(&self) -> CmdResult;
+    fn search_prev(&self) -> CmdResult;
+    fn search_close(&self) -> CmdResult;
+    fn prompt(&self) -> CmdResult;
+    fn edit_config(&self) -> CmdResult;
+    fn reload_config(&self) -> CmdResult;
 }
 
 pub enum ArgKind {
     Path,
+    Text,
     OneOf(&'static [&'static str]),
 }
 
@@ -74,7 +83,7 @@ impl CommandDef {
             .args
             .iter()
             .map(|a| match a.kind {
-                ArgKind::Path => format!("<{}>", a.name),
+                ArgKind::Path | ArgKind::Text => format!("<{}>", a.name),
                 ArgKind::OneOf(choices) => format!("<{}>", choices.join("|")),
             })
             .collect();
@@ -231,9 +240,73 @@ static COMMANDS: &[CommandDef] = &[
         desc: "Exit lwfm",
         run: |t, _| t.quit(),
     },
+    CommandDef {
+        name: "shell",
+        args: &[ArgSpec {
+            name: "command",
+            kind: ArgKind::Text,
+        }],
+        flags: &[FlagSpec {
+            name: "console",
+            takes_value: false,
+        }],
+        desc: "Run a command line ($f, $fs, $d substituted) without blocking",
+        run: |t, a| t.shell(a.arg(0), a.flag("console")),
+    },
+    CommandDef {
+        name: "search",
+        args: &[ArgSpec {
+            name: "text",
+            kind: ArgKind::Text,
+        }],
+        flags: &[],
+        desc: "Open the search input with text and select the first match",
+        run: |t, a| t.search(a.arg(0)),
+    },
+    CommandDef {
+        name: "search-next",
+        args: &[],
+        flags: &[],
+        desc: "Select the next entry matching the search",
+        run: |t, _| t.search_next(),
+    },
+    CommandDef {
+        name: "search-prev",
+        args: &[],
+        flags: &[],
+        desc: "Select the previous entry matching the search",
+        run: |t, _| t.search_prev(),
+    },
+    CommandDef {
+        name: "search-close",
+        args: &[],
+        flags: &[],
+        desc: "Close the search input and keep the selection",
+        run: |t, _| t.search_close(),
+    },
+    CommandDef {
+        name: "prompt",
+        args: &[],
+        flags: &[],
+        desc: "Type a command in the path bar",
+        run: |t, _| t.prompt(),
+    },
+    CommandDef {
+        name: "edit-config",
+        args: &[],
+        flags: &[],
+        desc: "Open config.lua in the editor (creates a starter config)",
+        run: |t, _| t.edit_config(),
+    },
+    CommandDef {
+        name: "reload-config",
+        args: &[],
+        flags: &[],
+        desc: "Reload config.lua",
+        run: |t, _| t.reload_config(),
+    },
 ];
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn commands() -> &'static [CommandDef] {
     COMMANDS
 }
@@ -249,7 +322,16 @@ pub fn compile(s: &str) -> Result<Invocation, CmdError> {
         positional,
         flags,
     } = parse::parse(s)?;
-    let def = lookup(&name).ok_or_else(|| CmdError(format!("unknown command `{name}`")))?;
+    compile_parts(&name, positional, flags)
+}
+
+/// Validates an already split command (as built from Lua method calls).
+pub fn compile_parts(
+    name: &str,
+    positional: Vec<String>,
+    flags: Vec<(String, Option<String>)>,
+) -> Result<Invocation, CmdError> {
+    let def = lookup(name).ok_or_else(|| CmdError(format!("unknown command `{name}`")))?;
 
     if positional.len() < def.args.len() {
         let missing = &def.args[positional.len()];
@@ -299,15 +381,20 @@ pub fn run_str(target: &dyn Target, s: &str) -> CmdResult {
     compile(s)?.run(target)
 }
 
+/// A `Target` that records every call, for tests of commands, keymaps and Lua.
 #[cfg(test)]
-mod tests {
+pub mod testing {
     use super::*;
     use std::cell::RefCell;
 
     #[derive(Default)]
-    struct Recorder(RefCell<Vec<String>>);
+    pub struct Recorder(pub RefCell<Vec<String>>);
 
     impl Recorder {
+        pub fn calls(&self) -> Vec<String> {
+            self.0.borrow().clone()
+        }
+
         fn log(&self, s: impl Into<String>) -> CmdResult {
             self.0.borrow_mut().push(s.into());
             Ok(())
@@ -354,7 +441,37 @@ mod tests {
         fn quit(&self) -> CmdResult {
             self.log("quit")
         }
+        fn shell(&self, command: &str, console: bool) -> CmdResult {
+            self.log(format!("shell {command} console={console}"))
+        }
+        fn search(&self, text: &str) -> CmdResult {
+            self.log(format!("search {text}"))
+        }
+        fn search_next(&self) -> CmdResult {
+            self.log("search-next")
+        }
+        fn search_prev(&self) -> CmdResult {
+            self.log("search-prev")
+        }
+        fn search_close(&self) -> CmdResult {
+            self.log("search-close")
+        }
+        fn prompt(&self) -> CmdResult {
+            self.log("prompt")
+        }
+        fn edit_config(&self) -> CmdResult {
+            self.log("edit-config")
+        }
+        fn reload_config(&self) -> CmdResult {
+            self.log("reload-config")
+        }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::Recorder;
+    use super::*;
 
     #[test]
     fn runs_commands() {
@@ -362,9 +479,19 @@ mod tests {
         run_str(&r, r#"cd "C:\Program Files""#).unwrap();
         run_str(&r, "sort size --reverse").unwrap();
         run_str(&r, "toggle-hidden").unwrap();
+        run_str(&r, "search rep").unwrap();
+        run_str(&r, r#"shell --console "nvim $f""#).unwrap();
+        run_str(&r, "search-next").unwrap();
         assert_eq!(
-            *r.0.borrow(),
-            [r"cd C:\Program Files", "sort size true", "toggle-hidden"]
+            r.calls(),
+            [
+                r"cd C:\Program Files",
+                "sort size true",
+                "toggle-hidden",
+                "search rep",
+                "shell nvim $f console=true",
+                "search-next"
+            ]
         );
     }
 
@@ -372,43 +499,31 @@ mod tests {
     fn unknown_command() {
         let r = Recorder::default();
         assert_eq!(run_str(&r, "cpoy").unwrap_err().0, "unknown command `cpoy`");
-        assert!(r.0.borrow().is_empty());
+        assert!(r.calls().is_empty());
     }
 
     #[test]
     fn invalid_arguments() {
-        let err = compile("sort color").unwrap_err().0;
-        assert!(err.contains("`color` is not a valid key"), "{err}");
-        assert!(
-            compile("cd")
-                .unwrap_err()
-                .0
-                .contains("missing argument <path>")
-        );
-        assert!(
-            compile("up now")
-                .unwrap_err()
-                .0
-                .contains("unexpected argument `now`")
-        );
-        assert!(
-            compile("sort name --fast")
-                .unwrap_err()
-                .0
-                .contains("unknown option `--fast`")
-        );
-        assert!(
-            compile("sort name --reverse=yes")
-                .unwrap_err()
-                .0
-                .contains("takes no value")
-        );
-        assert!(
-            compile(r#"cd "C:\x"#)
-                .unwrap_err()
-                .0
-                .contains("unterminated quote")
-        );
+        let err = |s: &str| compile(s).unwrap_err().0;
+        assert!(err("sort color").contains("`color` is not a valid key"));
+        assert!(err("cd").contains("missing argument <path>"));
+        assert!(err("up now").contains("unexpected argument `now`"));
+        assert!(err("sort name --fast").contains("unknown option `--fast`"));
+        assert!(err("sort name --reverse=yes").contains("takes no value"));
+        assert!(err(r#"cd "C:\x"#).contains("unterminated quote"));
+        assert!(err("shell").contains("missing argument <command>"));
+    }
+
+    #[test]
+    fn compile_parts_validates_like_strings() {
+        let r = Recorder::default();
+        compile_parts("sort", vec!["size".into()], vec![("reverse".into(), None)])
+            .unwrap()
+            .run(&r)
+            .unwrap();
+        assert_eq!(r.calls(), ["sort size true"]);
+        assert!(compile_parts("sort", vec!["color".into()], vec![]).is_err());
+        assert!(compile_parts("nope", vec![], vec![]).is_err());
     }
 
     #[test]
@@ -425,7 +540,17 @@ mod tests {
             "sort",
             "focus-path",
             "focus-list",
+            "path-submit",
+            "path-cancel",
             "quit",
+            "shell",
+            "search",
+            "search-next",
+            "search-prev",
+            "search-close",
+            "prompt",
+            "edit-config",
+            "reload-config",
         ] {
             assert!(names.contains(&required), "missing {required}");
         }
@@ -437,5 +562,9 @@ mod tests {
             "<name|size|mtime> [--reverse]"
         );
         assert_eq!(lookup("cd").unwrap().signature(), "<path>");
+        assert_eq!(
+            lookup("shell").unwrap().signature(),
+            "<command> [--console]"
+        );
     }
 }

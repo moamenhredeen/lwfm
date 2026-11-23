@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -14,7 +15,9 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::{
-    CreateFontIndirectW, DeleteObject, HFONT, HGDIOBJ, InvalidateRect, UpdateWindow,
+    COLOR_WINDOWTEXT, CreateFontIndirectW, CreateSolidBrush, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
+    DT_VCENTER, DeleteObject, DrawTextW, FillRect, GetSysColor, GetTextExtentPoint32W, HFONT,
+    HGDIOBJ, InvalidateRect, SetBkMode, SetTextColor, TRANSPARENT, UpdateWindow,
 };
 use windows::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
@@ -26,19 +29,30 @@ use windows::Win32::UI::Shell::{SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, ShellExecut
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::PCWSTR;
 
-use crate::cmd::registry::{self, CmdResult, Invocation, Target};
+use crate::cmd::registry::{self, CmdError, CmdResult, Target};
+use crate::config::discover::Env;
+use crate::config::{self, Loaded, watch};
 use crate::fs::entry::{self, Entry};
 use crate::fs::enumerate::{self, FsMsg};
-use crate::fs::model::{self, Model, Sort, SortKey};
+use crate::fs::model::{Model, Sort, SortKey};
 use crate::fs::path;
-use crate::keys::keymap::{Keymap, Scope};
+use crate::keys::chord::{Chord, Key, Mods, Named};
+use crate::keys::keymap::{Action, Binding, Lookup, Scope};
 use crate::keys::normalize;
+use crate::lua::api::{self, Event as LuaEvent, FmState, Host};
 use crate::nav::{History, Location};
+use crate::search::Query;
+use crate::shell;
 use crate::trace;
-use crate::ui::{list, pathbar, scale, send, statusbar, wide};
+use crate::ui::{list, pathbar, scale, searchbox, send, statusbar, wide};
 
 const WM_APP_WAKE: u32 = WM_APP + 1;
 const TIMER_REBUILD: usize = 1;
+/// Highlight behind the matched part of names while searching.
+const MATCH_COLOR: COLORREF = COLORREF(0x0000_E6FF); // RGB(255, 230, 0)
+/// Left margin of Name text inside the label rectangle (at 96 DPI), as the
+/// list control draws it.
+const LABEL_MARGIN: i32 = 2;
 /// While a directory is loading, the list is re-sorted at most this often.
 const REBUILD_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -47,11 +61,59 @@ pub struct Controls {
     pub path: HWND,
     pub list: HWND,
     pub status: HWND,
+    /// The find-as-you-type input, hidden while no search is active.
+    pub search: HWND,
+}
+
+/// What lwfm was started with, besides the window.
+pub struct Startup {
+    pub dir: Option<OsString>,
+    pub config: Loaded,
+    /// The config file found at startup, even if it failed to load.
+    pub config_file: Option<PathBuf>,
+    pub env: Env,
+    /// Config problems to show once the first listing appears.
+    pub message: Option<String>,
 }
 
 enum Event {
     Fs(FsMsg),
     Message(String),
+    /// New content of the watched config file (or a read error).
+    ConfigChanged(PathBuf, Result<String, String>),
+    /// `edit-config` made sure the file exists; `created` if it wrote the starter.
+    ConfigReady {
+        path: PathBuf,
+        created: bool,
+    },
+}
+
+/// Sends events from worker threads and wakes the UI thread at most once per
+/// batch of queued events.
+#[derive(Clone)]
+struct Waker {
+    tx: Sender<Event>,
+    pending: Arc<AtomicBool>,
+    hwnd: usize,
+}
+
+impl Waker {
+    fn send(&self, ev: Event) -> bool {
+        if self.tx.send(ev).is_err() {
+            return false;
+        }
+        if !self.pending.swap(true, Ordering::AcqRel) {
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(self.hwnd as *mut _)),
+                    WM_APP_WAKE,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        }
+        true
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -100,12 +162,31 @@ struct Selection {
     selected: HashSet<Box<[u16]>>,
 }
 
+fn join_messages(a: Option<String>, b: Option<String>) -> Option<String> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(format!("{a} | {b}")),
+        (a, b) => a.or(b),
+    }
+}
+
 pub struct App {
     ui: Controls,
     dpi: Cell<u32>,
     font: Cell<HFONT>,
     home: PathBuf,
-    keymap: Keymap,
+
+    config: RefCell<Rc<Loaded>>,
+    /// The config file in use or watched (it may have failed to load).
+    config_file: RefCell<Option<PathBuf>>,
+    config_env: Env,
+    watcher: RefCell<Option<watch::Watcher>>,
+    /// Chords of a key sequence typed so far.
+    pending: RefCell<Vec<Chord>>,
+    /// Hint bar text while a sequence is pending; replaces the message.
+    hint: RefCell<Option<String>>,
+    /// `$f` for the next `shell` run (the config file for `edit-config`).
+    file_override: RefCell<Option<PathBuf>>,
+    startup_fired: Cell<bool>,
 
     cwd: RefCell<Option<PathBuf>>,
     model: RefCell<Model>,
@@ -121,25 +202,44 @@ pub struct App {
     last_focus: Cell<HWND>,
 
     generation: Arc<AtomicU64>,
-    tx: Sender<Event>,
+    waker: Waker,
     rx: Receiver<Event>,
-    /// Set while a wake message is queued, so workers post at most one.
-    wake_pending: Arc<AtomicBool>,
+
+    /// Find-as-you-type: the current text (empty when the input is closed)
+    /// and how many visible entries match it.
+    search: RefCell<Query>,
+    search_matches: Cell<usize>,
+    /// Set while the app itself changes the search input, so its
+    /// notifications do not re-enter.
+    search_guard: Cell<bool>,
 
     startup_traced: Cell<bool>,
     done_at: Cell<Option<Instant>>,
 }
 
 impl App {
-    pub fn new(ui: Controls, dpi: u32) -> App {
+    pub fn new(ui: Controls, dpi: u32, startup: &mut Startup) -> App {
         let (tx, rx) = channel();
+        let waker = Waker {
+            tx,
+            pending: Arc::new(AtomicBool::new(false)),
+            hwnd: ui.main.0 as usize,
+        };
+        let loaded = std::mem::replace(&mut startup.config, config::defaults());
         let app = App {
             last_focus: Cell::new(ui.list),
             ui,
             dpi: Cell::new(dpi),
             font: Cell::new(HFONT::default()),
             home: path::home(),
-            keymap: Keymap::default_map(),
+            config: RefCell::new(Rc::new(loaded)),
+            config_file: RefCell::new(startup.config_file.clone()),
+            config_env: startup.env.clone(),
+            watcher: RefCell::new(None),
+            pending: RefCell::new(Vec::new()),
+            hint: RefCell::new(None),
+            file_override: RefCell::new(None),
+            startup_fired: Cell::new(false),
             cwd: RefCell::new(None),
             model: RefCell::new(Model::default()),
             history: RefCell::new(History::default()),
@@ -151,18 +251,24 @@ impl App {
             last_rebuild: Cell::new(None),
             timer_armed: Cell::new(false),
             generation: Arc::new(AtomicU64::new(0)),
-            tx,
+            waker,
             rx,
-            wake_pending: Arc::new(AtomicBool::new(false)),
+            search: RefCell::new(Query::default()),
+            search_matches: Cell::new(0),
+            search_guard: Cell::new(false),
             startup_traced: Cell::new(false),
             done_at: Cell::new(None),
         };
         app.apply_font();
+        app.apply_settings();
+        if let Some(p) = startup.config_file.clone() {
+            app.watch_config(p);
+        }
         app
     }
 
     /// Opens the start directory: the argument if given, else home.
-    pub fn start(&self, arg: Option<OsString>) {
+    pub fn start(&self, startup: &mut Startup) {
         unsafe {
             let _ = SetFocus(Some(self.ui.list));
         }
@@ -173,7 +279,8 @@ impl App {
             )
         });
         let mut nav = Nav::new(NavKind::Start);
-        let target = match arg {
+        nav.message = startup.message.take();
+        let target = match startup.dir.take() {
             Some(a) => {
                 nav.fallback_home = true;
                 let cwd = std::env::current_dir().unwrap_or_else(|_| self.home.clone());
@@ -199,6 +306,14 @@ impl App {
                 } else {
                     None
                 }
+            }
+            WM_COMMAND if lparam.0 == self.ui.search.0 as isize => {
+                match ((wparam.0 >> 16) & 0xFFFF) as u32 {
+                    EN_CHANGE if !self.search_guard.get() => self.on_search_changed(),
+                    EN_KILLFOCUS if !self.search_guard.get() => self.close_search(),
+                    _ => {}
+                }
+                Some(LRESULT(0))
             }
             WM_APP_WAKE => {
                 self.drain_events();
@@ -261,15 +376,20 @@ impl App {
         let pad = scale(4, dpi);
         let path_h = scale(26, dpi);
         let list_y = path_h + 2 * pad;
+        let list_h = (rc.bottom - list_y - status_h).max(0);
+        let (search_w, search_h) = (scale(searchbox::WIDTH, dpi), scale(searchbox::HEIGHT, dpi));
         unsafe {
             let _ = MoveWindow(self.ui.path, pad, pad, rc.right - 2 * pad, path_h, true);
-            let _ = MoveWindow(
-                self.ui.list,
-                0,
-                list_y,
-                rc.right,
-                (rc.bottom - list_y - status_h).max(0),
-                true,
+            let _ = MoveWindow(self.ui.list, 0, list_y, rc.right, list_h, true);
+            // Over the list's bottom-left corner, above the list in z-order.
+            let _ = SetWindowPos(
+                self.ui.search,
+                Some(HWND_TOP),
+                pad,
+                list_y + list_h - search_h - pad,
+                search_w.min(rc.right - 2 * pad),
+                search_h,
+                SWP_NOACTIVATE,
             );
         }
     }
@@ -292,7 +412,7 @@ impl App {
             }
             CreateFontIndirectW(&ncm.lfMessageFont)
         };
-        for hwnd in [self.ui.path, self.ui.list, self.ui.status] {
+        for hwnd in [self.ui.path, self.ui.list, self.ui.status, self.ui.search] {
             send(hwnd, WM_SETFONT, font.0 as usize, 1);
         }
         let old = self.font.replace(font);
@@ -318,27 +438,26 @@ impl App {
             }
             NM_CUSTOMDRAW => {
                 let cd = unsafe { &mut *(lparam.0 as *mut NMLVCUSTOMDRAW) };
+                let searching = !self.search.borrow().is_empty();
+                let subitem = NMCUSTOMDRAW_DRAW_STAGE(CDDS_ITEMPREPAINT.0 | CDDS_SUBITEM.0);
                 let r = match cd.nmcd.dwDrawStage {
                     CDDS_PREPAINT => CDRF_NOTIFYITEMDRAW,
                     CDDS_ITEMPREPAINT => {
-                        if let Ok(model) = self.model.try_borrow()
-                            && let Some(e) = model.entry(cd.nmcd.dwItemSpec)
-                        {
-                            if e.is_hidden() {
-                                cd.clrText = list::HIDDEN_COLOR;
-                            } else if e.is_dir() {
-                                cd.clrText = list::DIR_COLOR;
-                            }
+                        self.set_row_color(cd);
+                        // While searching, Name cells with a match are drawn by hand.
+                        CDRF_NEWFONT | if searching { CDRF_NOTIFYSUBITEMDRAW } else { 0 }
+                    }
+                    stage if stage == subitem => {
+                        self.set_row_color(cd);
+                        if cd.iSubItem == 0 && searching && self.paint_match(cd) {
+                            CDRF_SKIPDEFAULT
+                        } else {
+                            CDRF_NEWFONT
                         }
-                        CDRF_NEWFONT
                     }
                     _ => CDRF_DODEFAULT,
                 };
                 Some(LRESULT(r as isize))
-            }
-            LVN_ODFINDITEMW => {
-                let find = unsafe { &*(lparam.0 as *const NMLVFINDITEMW) };
-                Some(LRESULT(self.find_prefix(find).map_or(-1, |i| i as isize)))
             }
             LVN_COLUMNCLICK => {
                 let nm = unsafe { &*(lparam.0 as *const NMLISTVIEW) };
@@ -369,18 +488,77 @@ impl App {
         }
     }
 
-    /// Type-to-find over the visible entries, starting at `iStart` and wrapping.
-    fn find_prefix(&self, find: &NMLVFINDITEMW) -> Option<usize> {
-        if find.lvfi.flags.0 & LVFI_STRING.0 == 0 || find.lvfi.psz.is_null() {
-            return None;
+    /// Directory and hidden-item text colors from the config.
+    fn set_row_color(&self, cd: &mut NMLVCUSTOMDRAW) {
+        let colors = self.config.borrow().settings.colors;
+        if let Ok(model) = self.model.try_borrow()
+            && let Some(e) = model.entry(cd.nmcd.dwItemSpec)
+        {
+            if e.is_hidden() {
+                cd.clrText = COLORREF(colors.hidden);
+            } else if e.is_dir() {
+                cd.clrText = COLORREF(colors.dir);
+            }
         }
-        let prefix = unsafe { find.lvfi.psz.as_wide() };
-        let model = self.model.try_borrow().ok()?;
-        let n = model.visible.len();
-        let start = usize::try_from(find.iStart).unwrap_or(0);
-        (0..n)
-            .map(|k| (start + k) % n)
-            .find(|&i| model::has_prefix_ignore_case(&model.entry(i).unwrap().name, prefix))
+    }
+
+    /// Draws the Name cell of a row whose name matches the search, with the
+    /// match on a highlight background. Returns `false` (default drawing)
+    /// when the name does not match.
+    fn paint_match(&self, cd: &NMLVCUSTOMDRAW) -> bool {
+        let row = cd.nmcd.dwItemSpec;
+        let Some((mut text, range)) = self.model.try_borrow().ok().and_then(|m| {
+            let e = m.entry(row)?;
+            let range = self.search.borrow().find(&e.name)?;
+            Some((cell_text(e, 0), range))
+        }) else {
+            return false;
+        };
+        let hdc = cd.nmcd.hdc;
+        let rc = list::label_rect(self.ui.list, row);
+        let color = if cd.clrText.0 & 0xFF00_0000 != 0 {
+            COLORREF(unsafe { GetSysColor(COLOR_WINDOWTEXT) })
+        } else {
+            cd.clrText
+        };
+        let width = |s: &[u16]| {
+            let mut size = SIZE::default();
+            unsafe {
+                let _ = GetTextExtentPoint32W(hdc, s, &mut size);
+            }
+            size
+        };
+        let flags = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX;
+        let mut x = rc.left + scale(LABEL_MARGIN, self.dpi.get());
+        let draw = |segment: &mut [u16], x: i32| {
+            let mut r = RECT { left: x, ..rc };
+            unsafe { DrawTextW(hdc, segment, &mut r, flags) };
+        };
+        unsafe {
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, color);
+        }
+        let (head, rest) = text.split_at_mut(range.start);
+        let (hit, tail) = rest.split_at_mut(range.end - range.start);
+        draw(head, x);
+        x += width(head).cx;
+        let size = width(hit);
+        let top = rc.top + (rc.bottom - rc.top - size.cy) / 2;
+        let mark = RECT {
+            left: x,
+            top,
+            right: (x + size.cx).min(rc.right),
+            bottom: top + size.cy,
+        };
+        unsafe {
+            let brush = CreateSolidBrush(MATCH_COLOR);
+            FillRect(hdc, &mark, brush);
+            let _ = DeleteObject(HGDIOBJ(brush.0));
+        }
+        draw(hit, x);
+        x += size.cx;
+        draw(tail, x);
+        true
     }
 
     // ---- keyboard --------------------------------------------------------
@@ -400,33 +578,140 @@ impl App {
             _ => None,
         };
         let Some(chord) = chord else { return false };
-        let Some(inv) = self.keymap.lookup(self.focus_scope(), &chord) else {
-            return false;
-        };
-        self.run(inv);
-        true
-    }
-
-    fn focus_scope(&self) -> Scope {
-        let f = unsafe { GetFocus() };
-        if f == self.ui.path {
-            Scope::Input
-        } else if f == self.ui.list {
-            Scope::List
-        } else {
-            Scope::Global
+        let chain = self.scope_chain();
+        let mut seq = self.pending.borrow().clone();
+        let pending = !seq.is_empty();
+        if pending && chord == Chord::new(Mods::NONE, Key::Named(Named::Esc)) {
+            self.end_sequence();
+            return true;
+        }
+        seq.push(chord);
+        let config = self.config.borrow().clone();
+        match config.keymap.lookup(&chain, &seq) {
+            Lookup::Match(b) => {
+                self.end_sequence();
+                self.run_binding(&config, b);
+                true
+            }
+            Lookup::Prefix(hints) => {
+                let keys: Vec<String> = seq.iter().map(Chord::to_string).collect();
+                let items: Vec<String> = hints.iter().map(|(c, l)| format!("{c} {l}")).collect();
+                *self.hint.borrow_mut() = Some(format!(
+                    "{} ...   {}   (esc cancels)",
+                    keys.join(" "),
+                    items.join("   ")
+                ));
+                *self.pending.borrow_mut() = seq;
+                self.update_status();
+                true
+            }
+            Lookup::None if pending => {
+                // A chord that continues no binding ends the sequence and is dropped.
+                self.end_sequence();
+                true
+            }
+            Lookup::None => {
+                // Typing in the list opens the search input.
+                if msg.message == WM_CHAR
+                    && chain.contains(&Scope::List)
+                    && let Key::Char(c) = chord.key
+                {
+                    let inv = registry::compile_parts("search", vec![c.to_string()], vec![]);
+                    if let Err(e) = inv.and_then(|inv| inv.run(self)) {
+                        self.set_message(e.0);
+                    }
+                    return true;
+                }
+                false
+            }
         }
     }
 
-    fn run(&self, inv: &Invocation) {
-        if let Err(e) = inv.run(self) {
-            self.set_message(e.to_string());
+    fn scope_chain(&self) -> Vec<Scope> {
+        let f = unsafe { GetFocus() };
+        if f == self.ui.path {
+            vec![Scope::Input, Scope::Global]
+        } else if f == self.ui.search {
+            vec![Scope::Search, Scope::Global]
+        } else if f == self.ui.list {
+            vec![Scope::List, Scope::Global]
+        } else {
+            vec![Scope::Global]
+        }
+    }
+
+    fn end_sequence(&self) {
+        self.pending.borrow_mut().clear();
+        if self.hint.borrow_mut().take().is_some() {
+            self.update_status();
+        }
+    }
+
+    /// Runs a key binding or opener. `config` keeps the Lua state alive even
+    /// if the action reloads the configuration.
+    fn run_binding(&self, config: &Rc<Loaded>, b: &Binding) {
+        match &b.action {
+            Action::Commands(invs) => {
+                for inv in invs {
+                    if let Err(e) = inv.run(self) {
+                        self.set_message(e.0);
+                        break;
+                    }
+                }
+            }
+            Action::Lua(f) => {
+                let state = self.fm_state();
+                if let Err(e) = api::call(&config.lua, self, &state, f, vec![]) {
+                    self.set_message(e);
+                }
+            }
         }
     }
 
     fn run_str(&self, s: &str) {
         if let Err(e) = registry::run_str(self, s) {
             self.set_message(e.to_string());
+        }
+    }
+
+    fn fire(&self, event: LuaEvent, extra: Vec<String>) {
+        let config = self.config.borrow().clone();
+        let Some(handlers) = config.handlers.get(&event) else {
+            return;
+        };
+        for f in handlers {
+            let state = self.fm_state();
+            if let Err(e) = api::call(&config.lua, self, &state, f, extra.clone()) {
+                self.set_message(e);
+            }
+        }
+    }
+
+    // ---- state for Lua and shell commands ----------------------------------
+
+    fn entry_path(&self, i: usize) -> Option<PathBuf> {
+        let cwd = self.cwd.borrow().clone()?;
+        let name = self.model.borrow().entry(i).map(|e| os_name(&e.name))?;
+        Some(cwd.join(name))
+    }
+
+    fn focused_path(&self) -> Option<PathBuf> {
+        self.entry_path(list::focused(self.ui.list)?)
+    }
+
+    fn selected_paths(&self) -> Vec<PathBuf> {
+        list::selected(self.ui.list)
+            .into_iter()
+            .filter_map(|i| self.entry_path(i))
+            .collect()
+    }
+
+    fn fm_state(&self) -> FmState {
+        let text = |p: PathBuf| p.display().to_string();
+        FmState {
+            dir: text(self.base_dir()),
+            file: self.focused_path().map(text),
+            selection: self.selected_paths().into_iter().map(text).collect(),
         }
     }
 
@@ -443,33 +728,20 @@ impl App {
         self.loaded.set(0);
         self.update_status();
 
-        let tx = self.tx.clone();
-        let wake = self.wake_pending.clone();
-        let hwnd = self.ui.main.0 as usize;
+        let waker = self.waker.clone();
         enumerate::spawn(path, generation, self.generation.clone(), move |m| {
-            if tx.send(Event::Fs(m)).is_err() {
-                return false;
-            }
-            if !wake.swap(true, Ordering::AcqRel) {
-                unsafe {
-                    let _ = PostMessageW(
-                        Some(HWND(hwnd as *mut _)),
-                        WM_APP_WAKE,
-                        WPARAM(0),
-                        LPARAM(0),
-                    );
-                }
-            }
-            true
+            waker.send(Event::Fs(m))
         });
     }
 
     fn drain_events(&self) {
-        self.wake_pending.store(false, Ordering::Release);
+        self.waker.pending.store(false, Ordering::Release);
         while let Ok(ev) = self.rx.try_recv() {
             match ev {
                 Event::Fs(m) => self.on_fs(m),
                 Event::Message(s) => self.set_message(s),
+                Event::ConfigChanged(path, source) => self.on_config_changed(path, source),
+                Event::ConfigReady { path, created } => self.on_config_ready(path, created),
             }
         }
     }
@@ -495,6 +767,16 @@ impl App {
                 self.done_at.set(Some(Instant::now()));
                 self.rebuild();
                 self.restore.borrow_mut().take();
+                let kind = self.load.borrow().as_ref().map(|l| l.nav.kind);
+                if kind.is_some_and(|k| k != NavKind::Refresh) {
+                    if !self.startup_fired.replace(true) {
+                        self.fire(LuaEvent::Startup, vec![]);
+                    }
+                    self.fire(
+                        LuaEvent::DirEnter,
+                        vec![self.base_dir().display().to_string()],
+                    );
+                }
             }
             FsMsg::Error {
                 generation,
@@ -505,7 +787,7 @@ impl App {
                 match load {
                     Some(l) if !l.committed && l.nav.fallback_home => {
                         let mut nav = Nav::new(NavKind::Start);
-                        nav.message = Some(message);
+                        nav.message = join_messages(Some(message), l.nav.message);
                         self.navigate(self.home.clone(), nav);
                     }
                     Some(l) if l.committed => {
@@ -558,6 +840,10 @@ impl App {
         };
         *self.restore.borrow_mut() = Some(restore);
         self.model.borrow_mut().clear();
+        // A search belongs to one directory; refresh keeps it.
+        if nav.kind != NavKind::Refresh {
+            self.close_search();
+        }
         self.last_rebuild.set(None);
 
         let display = path.display().to_string();
@@ -594,8 +880,8 @@ impl App {
         }
     }
 
-    /// Re-sorts the view and refreshes the list, keeping the selection on
-    /// the same entries (or applying a pending restore target).
+    /// Re-sorts and re-filters the view and refreshes the list, keeping the
+    /// selection on the same entries (or applying a pending restore target).
     fn rebuild(&self) {
         if self.timer_armed.replace(false) {
             unsafe {
@@ -612,20 +898,22 @@ impl App {
         };
         list::set_count(self.ui.list, count);
 
-        if let Some(sel) = keep {
-            self.apply_selection(&sel);
-        } else {
-            let target = self.restore.borrow_mut().take().unwrap_or_default();
-            if !self.apply_selection(&target) {
-                // Not listed yet: keep waiting while loading, show a cursor meanwhile.
-                if count > 0 {
-                    list::select(self.ui.list, 0);
-                    list::focus(self.ui.list, 0);
-                }
-                if self.loading.get() {
+        let found = match keep {
+            Some(sel) => self.apply_selection(&sel),
+            None => {
+                let target = self.restore.borrow_mut().take().unwrap_or_default();
+                let found = self.apply_selection(&target);
+                if !found && self.loading.get() {
+                    // Not listed yet: keep waiting while loading.
                     *self.restore.borrow_mut() = Some(target);
                 }
+                found
             }
+        };
+        if !found && count > 0 {
+            // Always show a cursor; it lands on the first entry.
+            list::select(self.ui.list, 0);
+            list::focus(self.ui.list, 0);
         }
 
         unsafe {
@@ -633,6 +921,9 @@ impl App {
             let _ = UpdateWindow(self.ui.list);
         }
         self.last_rebuild.set(Some(Instant::now()));
+        if !self.search.borrow().is_empty() {
+            self.count_matches();
+        }
         self.update_status();
         self.trace_paint(count);
     }
@@ -697,6 +988,78 @@ impl App {
         focus.is_some()
     }
 
+    // ---- search ----------------------------------------------------------
+
+    fn count_matches(&self) {
+        let n = self.model.borrow().count_matches(&self.search.borrow());
+        self.search_matches.set(n);
+    }
+
+    /// The search input's text changed: select the first match.
+    fn on_search_changed(&self) {
+        let text = pathbar::text(self.ui.search);
+        if text.is_empty() {
+            self.close_search();
+            return;
+        }
+        let started = Instant::now();
+        *self.search.borrow_mut() = Query::new(&text);
+        let first = self
+            .model
+            .borrow()
+            .next_match(&self.search.borrow(), None, true);
+        if let Some(i) = first {
+            list::select_only(self.ui.list, i);
+        }
+        self.count_matches();
+        unsafe {
+            let _ = InvalidateRect(Some(self.ui.list), None, false);
+        }
+        self.update_status();
+        trace::log(|| {
+            format!(
+                "search: {} ({} matches)",
+                trace::ms(started.elapsed()),
+                self.search_matches.get()
+            )
+        });
+    }
+
+    fn step_match(&self, forward: bool) {
+        if self.search.borrow().is_empty() {
+            return;
+        }
+        let from = list::focused(self.ui.list);
+        let next = self
+            .model
+            .borrow()
+            .next_match(&self.search.borrow(), from, forward);
+        if let Some(i) = next {
+            list::select_only(self.ui.list, i);
+        }
+    }
+
+    /// Hides the search input and its highlights; the selection stays.
+    fn close_search(&self) {
+        if self.search.borrow().is_empty() && !searchbox::is_visible(self.ui.search) {
+            return;
+        }
+        self.search_guard.set(true);
+        *self.search.borrow_mut() = Query::default();
+        if unsafe { GetFocus() } == self.ui.search {
+            unsafe {
+                let _ = SetFocus(Some(self.ui.list));
+            }
+        }
+        pathbar::set_text(self.ui.search, "");
+        searchbox::hide(self.ui.search);
+        self.search_guard.set(false);
+        unsafe {
+            let _ = InvalidateRect(Some(self.ui.list), None, false);
+        }
+        self.update_status();
+    }
+
     // ---- status ----------------------------------------------------------
 
     fn set_message(&self, s: String) {
@@ -713,14 +1076,96 @@ impl App {
                 .try_borrow()
                 .map(|m| m.visible.len())
                 .unwrap_or(0);
-            match list::selected_count(self.ui.list) {
-                0 => format!("{n} items"),
-                s => format!("{n} items, {s} selected"),
+            let query = self.search.borrow().text().to_string();
+            let selected = list::selected_count(self.ui.list);
+            match (query.is_empty(), self.search_matches.get(), selected) {
+                (false, 0, _) => format!("Search: {query}  no matches"),
+                (false, 1, _) => format!("Search: {query}  1 match"),
+                (false, m, _) => format!("Search: {query}  {m} matches"),
+                (true, _, 0) => format!("{n} items"),
+                (true, _, s) => format!("{n} items, {s} selected"),
             }
         };
         statusbar::set_part(self.ui.status, 0, &counts);
-        let msg = self.message.borrow().clone();
+        let msg = match self.hint.borrow().as_ref() {
+            Some(h) => h.clone(),
+            None => self.message.borrow().clone(),
+        };
         statusbar::set_part(self.ui.status, 1, &msg);
+    }
+
+    // ---- configuration ---------------------------------------------------
+
+    fn apply_settings(&self) {
+        let (show_hidden, sort) = {
+            let c = self.config.borrow();
+            (c.settings.show_hidden, c.settings.sort)
+        };
+        {
+            let mut m = self.model.borrow_mut();
+            m.show_hidden = show_hidden;
+            m.sort = sort;
+        }
+    }
+
+    fn watch_config(&self, path: PathBuf) {
+        if self
+            .watcher
+            .borrow()
+            .as_ref()
+            .is_some_and(|w| w.path == path)
+        {
+            return;
+        }
+        let waker = self.waker.clone();
+        let w = watch::watch(path, move |p, source| {
+            waker.send(Event::ConfigChanged(p, source));
+        });
+        *self.watcher.borrow_mut() = w;
+    }
+
+    fn on_config_changed(&self, path: PathBuf, source: Result<String, String>) {
+        let started = Instant::now();
+        let loaded = source.and_then(|src| config::load(Some(&path), Some(&src)));
+        trace::log(|| {
+            format!(
+                "config loaded in {} ({})",
+                trace::ms(started.elapsed()),
+                path.display()
+            )
+        });
+        match loaded {
+            Ok(l) => {
+                let msg = if l.warnings.is_empty() {
+                    "Config reloaded".to_string()
+                } else {
+                    format!("Config reloaded with warnings: {}", l.warnings.join("; "))
+                };
+                *self.config_file.borrow_mut() = Some(path.clone());
+                *self.config.borrow_mut() = Rc::new(l);
+                self.end_sequence();
+                self.apply_settings();
+                self.rebuild();
+                self.watch_config(path);
+                self.set_message(msg);
+            }
+            Err(e) => self.set_message(e),
+        }
+    }
+
+    fn on_config_ready(&self, path: PathBuf, created: bool) {
+        if created {
+            self.on_config_changed(path.clone(), Ok(config::STARTER.to_string()));
+            self.set_message(format!("Created {}", path.display()));
+        }
+        let editor = self.config.borrow().settings.editor.def.name;
+        *self.file_override.borrow_mut() = Some(path);
+        let config = self.config.borrow().clone();
+        let result = config.settings.editor.run(self);
+        self.file_override.borrow_mut().take();
+        if let Err(e) = result {
+            self.set_message(format!("editor ({editor}): {e}"));
+        }
     }
 
     // ---- helpers ---------------------------------------------------------
@@ -740,8 +1185,7 @@ impl App {
     }
 
     fn shell_open(&self, file: PathBuf, dir: PathBuf) {
-        let tx = self.tx.clone();
-        let wake = self.wake_pending.clone();
+        let waker = self.waker.clone();
         let hwnd = self.ui.main.0 as usize;
         std::thread::spawn(move || unsafe {
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
@@ -760,14 +1204,7 @@ impl App {
                 && e.code() != ERROR_CANCELLED.to_hresult()
             {
                 let msg = format!("Cannot open {}: {}", file.display(), e.message());
-                if tx.send(Event::Message(msg)).is_ok() && !wake.swap(true, Ordering::AcqRel) {
-                    let _ = PostMessageW(
-                        Some(HWND(hwnd as *mut _)),
-                        WM_APP_WAKE,
-                        WPARAM(0),
-                        LPARAM(0),
-                    );
-                }
+                waker.send(Event::Message(msg));
             }
             CoUninitialize();
         });
@@ -797,6 +1234,12 @@ fn cell_text(e: &Entry, column: i32) -> Vec<u16> {
 
 fn os_name(name: &[u16]) -> OsString {
     OsString::from_wide(name)
+}
+
+impl Host for App {
+    fn notify(&self, msg: &str) {
+        self.set_message(msg.to_string());
+    }
 }
 
 impl Target for App {
@@ -855,11 +1298,17 @@ impl Target for App {
         else {
             return Ok(());
         };
-        let target = cwd.join(name);
+        let target = cwd.join(&name);
         if is_dir {
             self.navigate(target, Nav::new(NavKind::New));
-        } else {
-            self.shell_open(target, cwd);
+            return Ok(());
+        }
+        let config = self.config.borrow().clone();
+        let file_name = name.to_string_lossy();
+        let opener = shell::best_opener(config.openers.iter().map(|(p, _)| p.as_str()), &file_name);
+        match opener {
+            Some(k) => self.run_binding(&config, &config.openers[k].1),
+            None => self.shell_open(target, cwd),
         }
         Ok(())
     }
@@ -903,6 +1352,17 @@ impl Target for App {
 
     fn path_submit(&self) -> CmdResult {
         let text = pathbar::text(self.ui.path);
+        if let Some(command) = text.trim_start().strip_prefix(':') {
+            if command.trim().is_empty() {
+                return self.path_cancel();
+            }
+            registry::run_str(self, command)?;
+            // Success: show the directory again (unless the command moved focus there).
+            if unsafe { GetFocus() } == self.ui.path {
+                self.path_cancel()?;
+            }
+            return Ok(());
+        }
         if text.trim().is_empty() {
             return Ok(());
         }
@@ -925,6 +1385,121 @@ impl Target for App {
         unsafe {
             let _ = DestroyWindow(self.ui.main);
         }
+        Ok(())
+    }
+
+    fn shell(&self, command: &str, console: bool) -> CmdResult {
+        let dir = self.base_dir();
+        let focused = self
+            .file_override
+            .borrow()
+            .clone()
+            .or_else(|| self.focused_path());
+        let selection = if self.file_override.borrow().is_some() {
+            Vec::new()
+        } else {
+            self.selected_paths()
+        };
+        let ctx = shell::Context {
+            dir: &dir,
+            focused: focused.as_deref(),
+            selection: &selection,
+        };
+        let line = shell::expand(command, &ctx).map_err(CmdError)?;
+        let waker = self.waker.clone();
+        shell::launch(line, dir.clone(), console, move |msg| {
+            waker.send(Event::Message(msg));
+        });
+        Ok(())
+    }
+
+    fn search(&self, text: &str) -> CmdResult {
+        searchbox::show(self.ui.search);
+        unsafe {
+            let _ = SetFocus(Some(self.ui.search));
+        }
+        // Setting the text runs the jump through EN_CHANGE.
+        pathbar::set_text(self.ui.search, text);
+        let end = text.encode_utf16().count();
+        send(self.ui.search, EM_SETSEL, end, end as isize);
+        if text.is_empty() {
+            self.close_search();
+        }
+        Ok(())
+    }
+
+    fn search_next(&self) -> CmdResult {
+        self.step_match(true);
+        Ok(())
+    }
+
+    fn search_prev(&self) -> CmdResult {
+        self.step_match(false);
+        Ok(())
+    }
+
+    fn search_close(&self) -> CmdResult {
+        self.close_search();
+        Ok(())
+    }
+
+    fn prompt(&self) -> CmdResult {
+        unsafe {
+            let _ = SetFocus(Some(self.ui.path));
+        }
+        pathbar::set_text(self.ui.path, ":");
+        send(self.ui.path, EM_SETSEL, 1, 1);
+        Ok(())
+    }
+
+    fn edit_config(&self) -> CmdResult {
+        let path = self
+            .config_file
+            .borrow()
+            .clone()
+            .or_else(|| self.config_env.default_location())
+            .ok_or_else(|| CmdError("no location for a config file (APPDATA is not set)".into()))?;
+        let waker = self.waker.clone();
+        std::thread::spawn(move || {
+            let created = !path.exists();
+            if created {
+                let write = path
+                    .parent()
+                    .map_or(Ok(()), std::fs::create_dir_all)
+                    .and_then(|_| std::fs::write(&path, config::STARTER));
+                if let Err(e) = write {
+                    waker.send(Event::Message(format!(
+                        "Cannot create {}: {e}",
+                        path.display()
+                    )));
+                    return;
+                }
+            }
+            waker.send(Event::ConfigReady { path, created });
+        });
+        Ok(())
+    }
+
+    fn reload_config(&self) -> CmdResult {
+        let known = self.config_file.borrow().clone();
+        let env = self.config_env.clone();
+        let waker = self.waker.clone();
+        std::thread::spawn(move || {
+            let found =
+                known.or_else(
+                    || match config::discover::discover(&env, &|p| p.is_file()) {
+                        config::discover::Found::File(p) => Some(p),
+                        _ => None,
+                    },
+                );
+            match found {
+                Some(path) => {
+                    let source = config::read_file(&path);
+                    waker.send(Event::ConfigChanged(path, source))
+                }
+                None => waker.send(Event::Message("No config file to reload".into())),
+            };
+        });
         Ok(())
     }
 }
