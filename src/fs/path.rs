@@ -1,14 +1,8 @@
-//! Path handling: user input resolution, `~` expansion, parents and the
-//! `\\?\` prefix for long paths. Paths are kept absolute and normalized;
-//! the prefix is only added when calling file APIs.
+//! Path handling: user input resolution, `~` expansion and parents. Paths
+//! are kept absolute and normalized; the `\\?\` prefix for long paths is
+//! added by `lwfm-win` when it calls file APIs.
 
-use std::ffi::OsStr;
-use std::os::windows::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
-
-/// Paths at least this long get the `\\?\` prefix. Lower than 260 so that a
-/// `\*` search suffix still fits for the `FindFirstFileExW` fallback.
-const LONG_PATH: usize = 240;
 
 /// Resolves user input against the current directory: expands `~`, joins
 /// relative paths and removes `.` and `..` components.
@@ -55,32 +49,6 @@ pub fn home() -> PathBuf {
     std::env::var_os("USERPROFILE")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("C:\\"))
-}
-
-/// NUL-terminated UTF-16 for file APIs, with `\\?\` or `\\?\UNC\` for long
-/// paths. `suffix` is appended before termination (e.g. `\*`).
-pub fn to_api_wide(p: &Path, suffix: &str) -> Vec<u16> {
-    let s: Vec<u16> = p.as_os_str().encode_wide().collect();
-    let mut out = Vec::with_capacity(s.len() + suffix.len() + 9);
-    let already = s.starts_with(&wide_str(r"\\?\"));
-    if s.len() + suffix.len() >= LONG_PATH && !already {
-        if let Some(unc) = s.strip_prefix(&wide_str(r"\\")[..]) {
-            out.extend(wide_str(r"\\?\UNC\"));
-            out.extend_from_slice(unc);
-        } else {
-            out.extend(wide_str(r"\\?\"));
-            out.extend_from_slice(&s);
-        }
-    } else {
-        out.extend_from_slice(&s);
-    }
-    out.extend(OsStr::new(suffix).encode_wide());
-    out.push(0);
-    out
-}
-
-fn wide_str(s: &str) -> Vec<u16> {
-    s.encode_utf16().collect()
 }
 
 #[cfg(test)]
@@ -131,26 +99,5 @@ mod tests {
             parent(Path::new(r"\\server\share\x")).unwrap(),
             Path::new(r"\\server\share\")
         );
-    }
-
-    fn api(p: &str) -> String {
-        let w = to_api_wide(Path::new(p), "");
-        String::from_utf16(&w[..w.len() - 1]).unwrap()
-    }
-
-    #[test]
-    fn long_path_prefix() {
-        assert_eq!(api(r"C:\short"), r"C:\short");
-        let long = format!(r"C:\{}", "a".repeat(300));
-        assert_eq!(api(&long), format!(r"\\?\{long}"));
-        let unc = format!(r"\\server\share\{}", "b".repeat(300));
-        assert_eq!(
-            api(&unc),
-            format!(r"\\?\UNC\server\share\{}", "b".repeat(300))
-        );
-        let pre = format!(r"\\?\C:\{}", "c".repeat(300));
-        assert_eq!(api(&pre), pre);
-        let w = to_api_wide(Path::new(r"C:\x"), r"\*");
-        assert_eq!(String::from_utf16(&w[..w.len() - 1]).unwrap(), r"C:\x\*");
     }
 }

@@ -4,12 +4,6 @@
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
-use windows::Win32::Globalization::{
-    CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN, CompareStringEx, NORM_IGNORECASE,
-    SORT_DIGITSASNUMBERS,
-};
-use windows::core::PCWSTR;
-
 use super::entry::Entry;
 use crate::search::Query;
 
@@ -73,23 +67,7 @@ pub struct Model {
 
 /// Natural, case-insensitive, locale-aware name order (`file2` < `file10`).
 pub fn compare_names(a: &[u16], b: &[u16]) -> Ordering {
-    let r = unsafe {
-        CompareStringEx(
-            PCWSTR::null(),
-            NORM_IGNORECASE | SORT_DIGITSASNUMBERS,
-            a,
-            b,
-            None,
-            None,
-            None,
-        )
-    };
-    match r {
-        CSTR_LESS_THAN => Ordering::Less,
-        CSTR_GREATER_THAN => Ordering::Greater,
-        CSTR_EQUAL => a.cmp(b),
-        _ => a.cmp(b),
-    }
+    lwfm_win::text::compare_natural(a, b)
 }
 
 impl Model {
@@ -189,7 +167,6 @@ impl Model {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN};
 
     fn w(s: &str) -> Box<[u16]> {
         s.encode_utf16().collect()
@@ -198,18 +175,20 @@ mod tests {
     fn file(name: &str, size: u64, mtime: i64) -> Entry {
         Entry {
             name: w(name),
-            attrs: 0,
             size,
             mtime,
+            dir: false,
+            hidden: false,
         }
     }
 
     fn dir(name: &str) -> Entry {
         Entry {
             name: w(name),
-            attrs: FILE_ATTRIBUTE_DIRECTORY.0,
             size: 0,
             mtime: 0,
+            dir: true,
+            hidden: false,
         }
     }
 
@@ -265,9 +244,10 @@ mod tests {
     fn hidden_entries_are_not_matched() {
         let secret = Entry {
             name: w("secret-report.txt"),
-            attrs: FILE_ATTRIBUTE_HIDDEN.0,
             size: 0,
             mtime: 0,
+            dir: false,
+            hidden: true,
         };
         let mut m = model(vec![file("report.txt", 0, 0), secret]);
         assert_eq!(m.count_matches(&Query::new("REPORT")), 1);
@@ -319,9 +299,10 @@ mod tests {
     fn hidden_toggle_without_reenumeration() {
         let secret = Entry {
             name: w("secret.txt"),
-            attrs: FILE_ATTRIBUTE_HIDDEN.0,
             size: 0,
             mtime: 0,
+            dir: false,
+            hidden: true,
         };
         let mut m = model(vec![file("a.txt", 0, 0), secret]);
         assert_eq!(names(&m), ["a.txt"]);

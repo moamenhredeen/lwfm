@@ -13,19 +13,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
+use lwfm_win::process;
+use lwfm_win::window::WindowToken;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::{
     COLOR_WINDOWTEXT, CreateFontIndirectW, CreateSolidBrush, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
     DT_VCENTER, DeleteObject, DrawTextW, FillRect, GetSysColor, GetTextExtentPoint32W, HFONT,
     HGDIOBJ, InvalidateRect, SetBkMode, SetTextColor, TRANSPARENT, UpdateWindow,
 };
-use windows::Win32::System::Com::{
-    COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
-};
 use windows::Win32::UI::Controls::*;
 use windows::Win32::UI::HiDpi::SystemParametersInfoForDpi;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
-use windows::Win32::UI::Shell::{SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, ShellExecuteExW};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::PCWSTR;
 
@@ -729,9 +727,16 @@ impl App {
         self.update_status();
 
         let waker = self.waker.clone();
-        enumerate::spawn(path, generation, self.generation.clone(), move |m| {
+        let display = path.display().to_string();
+        let spawned = enumerate::spawn(path, generation, self.generation.clone(), move |m| {
             waker.send(Event::Fs(m))
         });
+        if let Err(e) = spawned {
+            self.on_fs(FsMsg::Error {
+                generation,
+                message: format!("Cannot list {display}: {e}"),
+            });
+        }
     }
 
     fn drain_events(&self) {
@@ -1186,27 +1191,12 @@ impl App {
 
     fn shell_open(&self, file: PathBuf, dir: PathBuf) {
         let waker = self.waker.clone();
-        let hwnd = self.ui.main.0 as usize;
-        std::thread::spawn(move || unsafe {
-            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-            let file_w = wide(&file);
-            let dir_w = wide(&dir);
-            let mut info = SHELLEXECUTEINFOW {
-                cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
-                fMask: SEE_MASK_NOASYNC,
-                hwnd: HWND(hwnd as *mut _),
-                lpFile: PCWSTR(file_w.as_ptr()),
-                lpDirectory: PCWSTR(dir_w.as_ptr()),
-                nShow: SW_SHOWNORMAL.0,
-                ..Default::default()
-            };
-            if let Err(e) = ShellExecuteExW(&mut info)
-                && e.code() != ERROR_CANCELLED.to_hresult()
-            {
-                let msg = format!("Cannot open {}: {}", file.display(), e.message());
+        let owner = WindowToken::from_raw(self.ui.main.0 as isize);
+        std::thread::spawn(move || {
+            if let Err(e) = process::shell_open(owner, &file, &dir) {
+                let msg = format!("Cannot open {}: {e}", file.display());
                 waker.send(Event::Message(msg));
             }
-            CoUninitialize();
         });
     }
 }
@@ -1223,7 +1213,7 @@ fn cell_text(e: &Entry, column: i32) -> Vec<u16> {
         }
         1 if e.is_dir() => Vec::new(),
         1 => entry::format_size(e.size).encode_utf16().collect(),
-        2 => entry::to_local(e.mtime)
+        2 => lwfm_win::text::to_local(e.mtime)
             .map(|t| entry::format_time(&t))
             .unwrap_or_default()
             .encode_utf16()

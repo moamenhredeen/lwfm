@@ -3,68 +3,22 @@
 
 use std::path::{Path, PathBuf};
 
-use windows::Win32::Foundation::CloseHandle;
-use windows::Win32::System::Threading::{
-    CREATE_NEW_CONSOLE, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
-    GetExitCodeProcess, INFINITE, PROCESS_INFORMATION, STARTUPINFOW, WaitForSingleObject,
-};
-use windows::core::{PCWSTR, PWSTR};
+use lwfm_win::process;
 
 /// Runs `line` through `cmd.exe /d /s /c` in `dir` on a new thread. Without a
 /// console the process is waited for and a non-zero exit code is reported;
 /// launch failures are reported too.
 pub fn launch(line: String, dir: PathBuf, console: bool, report: impl Fn(String) + Send + 'static) {
-    std::thread::spawn(move || {
-        let comspec = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into());
-        let mut cmdline: Vec<u16> = format!("\"{comspec}\" /d /s /c \"{line}\"")
-            .encode_utf16()
-            .chain([0])
-            .collect();
-        let dir_w: Vec<u16> = dir
-            .as_os_str()
-            .to_string_lossy()
-            .encode_utf16()
-            .chain([0])
-            .collect();
-        let startup = STARTUPINFOW {
-            cb: size_of::<STARTUPINFOW>() as u32,
-            ..Default::default()
-        };
-        let mut info = PROCESS_INFORMATION::default();
-        let flags = CREATE_UNICODE_ENVIRONMENT
-            | if console {
-                CREATE_NEW_CONSOLE
-            } else {
-                CREATE_NO_WINDOW
-            };
-        let created = unsafe {
-            CreateProcessW(
-                PCWSTR::null(),
-                Some(PWSTR(cmdline.as_mut_ptr())),
-                None,
-                None,
-                false,
-                flags,
-                None,
-                PCWSTR(dir_w.as_ptr()),
-                &startup,
-                &mut info,
-            )
-        };
-        if let Err(e) = created {
-            report(format!("Cannot run `{line}`: {}", e.message()));
-            return;
-        }
-        unsafe {
-            let _ = CloseHandle(info.hThread);
-            if !console {
-                WaitForSingleObject(info.hProcess, INFINITE);
-                let mut code = 0u32;
-                if GetExitCodeProcess(info.hProcess, &mut code).is_ok() && code != 0 {
-                    report(format!("`{line}` exited with code {code}"));
-                }
+    std::thread::spawn(move || match process::spawn_cmd(&line, &dir, console) {
+        Err(e) => report(format!("Cannot run `{line}`: {e}")),
+        // A console program reports for itself in its own window.
+        Ok(_) if console => {}
+        Ok(child) => {
+            if let Ok(code) = child.wait()
+                && code != 0
+            {
+                report(format!("`{line}` exited with code {code}"));
             }
-            let _ = CloseHandle(info.hProcess);
         }
     });
 }

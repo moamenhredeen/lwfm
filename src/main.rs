@@ -17,15 +17,6 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use config::discover::{self, Env, Found};
-use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-    FILE_SHARE_WRITE, OPEN_EXISTING,
-};
-use windows::Win32::System::Console::{
-    ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
-    SetStdHandle,
-};
-use windows::core::w;
 
 struct Args {
     dir: Option<OsString>,
@@ -84,33 +75,9 @@ fn load_config(env: &Env) -> (config::Loaded, Option<PathBuf>, Option<String>) {
     result
 }
 
-/// Sends stdout to the terminal that started this GUI-subsystem process,
-/// unless it is already redirected.
-fn attach_console() {
-    unsafe {
-        let redirected =
-            GetStdHandle(STD_OUTPUT_HANDLE).is_ok_and(|h| !h.is_invalid() && !h.0.is_null());
-        if redirected || AttachConsole(ATTACH_PARENT_PROCESS).is_err() {
-            return;
-        }
-        if let Ok(con) = CreateFileW(
-            w!("CONOUT$"),
-            (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0,
-            FILE_SHARE_WRITE,
-            None,
-            OPEN_EXISTING,
-            FILE_FLAGS_AND_ATTRIBUTES(0),
-            None,
-        ) {
-            let _ = SetStdHandle(STD_OUTPUT_HANDLE, con);
-            let _ = SetStdHandle(STD_ERROR_HANDLE, con);
-        }
-    }
-}
-
 /// `lwfm --check-config`: validate and report, no window.
 fn check_config(env: &Env) -> i32 {
-    attach_console();
+    lwfm_win::sys::attach_parent_console();
     match discover::discover(env, &|p| p.is_file()) {
         Found::File(p) => match load_file(&p) {
             Ok(l) => {

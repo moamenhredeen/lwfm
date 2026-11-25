@@ -6,3 +6,16 @@
 
 #![deny(clippy::undocumented_unsafe_blocks)]
 #![deny(clippy::multiple_unsafe_ops_per_block)]
+
+mod error;
+mod handle;
+mod num;
+mod wide;
+
+pub mod fs;
+pub mod process;
+pub mod sys;
+pub mod text;
+pub mod window;
+
+pub use error::{Error, ErrorKind};
