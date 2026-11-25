@@ -97,7 +97,15 @@ name = "lwfm"
 version = "0.1.0"
 dependencies = [
  "embed-manifest",
+ "lwfm-win",
  "mlua",
+ "windows",
+]
+
+[[package]]
+name = "lwfm-win"
+version = "0.1.0"
+dependencies = [
  "windows",
 ]
 
