@@ -156,7 +156,7 @@ impl Target for App {
             focused: focused.as_deref(),
             selection: &selection,
         };
-        let line = shell::expand(command, &ctx).map_err(CmdError)?;
+        let line = shell::expand(command, &ctx).map_err(|e| CmdError(e.to_string()))?;
         let waker = self.waker.clone();
         shell::launch(line, dir.clone(), console, move |msg| {
             waker.send(Event::Message(msg));

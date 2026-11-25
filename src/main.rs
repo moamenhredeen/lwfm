@@ -41,7 +41,7 @@ fn parse_args() -> Args {
     args
 }
 
-fn load_file(path: &Path) -> Result<config::Loaded, String> {
+fn load_file(path: &Path) -> Result<config::Loaded, config::ConfigError> {
     config::read_file(path).and_then(|src| config::load(Some(path), Some(&src)))
 }
 
@@ -56,7 +56,7 @@ fn load_config(env: &Env) -> (config::Loaded, Option<PathBuf>, Option<String>) {
                     .then(|| format!("Config warnings: {}", l.warnings.join("; ")));
                 (l, Some(p), msg)
             }
-            Err(e) => (config::defaults(), Some(p), Some(e)),
+            Err(e) => (config::defaults(), Some(p), Some(e.to_string())),
         },
         Found::Missing(p) => (
             config::defaults(),

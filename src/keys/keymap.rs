@@ -3,9 +3,11 @@
 //! prefix with hints for the next chord, or nothing.
 
 use std::collections::HashMap;
+use std::fmt;
+use std::str::FromStr;
 
 use super::chord::Chord;
-use crate::cmd::registry::{self, Invocation};
+use crate::cmd::registry::{self, CmdError, Invocation};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Scope {
@@ -18,16 +20,6 @@ pub enum Scope {
 impl Scope {
     pub const NAMES: &'static [&'static str] = &["global", "list", "search", "input"];
 
-    pub fn from_name(s: &str) -> Option<Scope> {
-        Some(match s {
-            "global" => Scope::Global,
-            "list" => Scope::List,
-            "search" => Scope::Search,
-            "input" => Scope::Input,
-            _ => return None,
-        })
-    }
-
     pub fn name(self) -> &'static str {
         match self {
             Scope::Global => "global",
@@ -37,6 +29,36 @@ impl Scope {
         }
     }
 }
+
+/// The text is not one of [`Scope::NAMES`].
+#[derive(Debug, PartialEq, Eq)]
+pub struct UnknownScope;
+
+impl FromStr for Scope {
+    type Err = UnknownScope;
+
+    fn from_str(s: &str) -> Result<Scope, UnknownScope> {
+        match s {
+            "global" => Ok(Scope::Global),
+            "list" => Ok(Scope::List),
+            "search" => Ok(Scope::Search),
+            "input" => Ok(Scope::Input),
+            _ => Err(UnknownScope),
+        }
+    }
+}
+
+/// A key text or keymap layer that cannot be used.
+#[derive(Debug, PartialEq, Eq)]
+pub struct KeymapError(String);
+
+impl fmt::Display for KeymapError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for KeymapError {}
 
 pub enum Action {
     /// Command strings compiled at load, run in order until one fails.
@@ -51,10 +73,10 @@ pub struct Binding {
 }
 
 impl Binding {
-    pub fn commands(cmds: &[&str], desc: Option<&str>) -> Result<Binding, String> {
+    pub fn commands(cmds: &[&str], desc: Option<&str>) -> Result<Binding, CmdError> {
         let invs = cmds
             .iter()
-            .map(|c| registry::compile(c).map_err(|e| e.0))
+            .map(|c| registry::compile(c))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Binding {
             action: Action::Commands(invs),
@@ -72,7 +94,7 @@ pub struct Entry {
 }
 
 impl Entry {
-    pub fn new(scope: Scope, keys: &str, binding: Option<Binding>) -> Result<Entry, String> {
+    pub fn new(scope: Scope, keys: &str, binding: Option<Binding>) -> Result<Entry, KeymapError> {
         Ok(Entry {
             scope,
             keys: keys.to_string(),
@@ -83,19 +105,22 @@ impl Entry {
 }
 
 /// Parses `"ctrl+g d"` into chords.
-pub fn parse_seq(keys: &str) -> Result<Vec<Chord>, String> {
+pub fn parse_seq(keys: &str) -> Result<Vec<Chord>, KeymapError> {
     let seq = keys
         .split_whitespace()
-        .map(|c| c.parse::<Chord>().map_err(|e| format!("`{keys}`: {e}")))
+        .map(|c| {
+            c.parse::<Chord>()
+                .map_err(|e| KeymapError(format!("`{keys}`: {e}")))
+        })
         .collect::<Result<Vec<_>, _>>()?;
     if seq.is_empty() {
-        return Err("empty key text".into());
+        return Err(KeymapError("empty key text".into()));
     }
     Ok(seq)
 }
 
 /// Rejects duplicates and prefix conflicts within one layer.
-fn check_layer(entries: &[Entry]) -> Result<(), String> {
+fn check_layer(entries: &[Entry]) -> Result<(), KeymapError> {
     for (i, a) in entries.iter().enumerate() {
         for b in &entries[i + 1..] {
             if a.scope != b.scope {
@@ -103,10 +128,10 @@ fn check_layer(entries: &[Entry]) -> Result<(), String> {
             }
             let scope = a.scope.name();
             if a.seq == b.seq {
-                return Err(format!(
+                return Err(KeymapError(format!(
                     "`{}` and `{}` are the same keys in {scope}",
                     a.keys, b.keys
-                ));
+                )));
             }
             let (short, long) = if a.seq.len() < b.seq.len() {
                 (a, b)
@@ -114,10 +139,10 @@ fn check_layer(entries: &[Entry]) -> Result<(), String> {
                 (b, a)
             };
             if long.seq.starts_with(&short.seq) {
-                return Err(format!(
+                return Err(KeymapError(format!(
                     "`{}` is a prefix of `{}` in {scope}; a key sequence cannot also be a binding",
                     short.keys, long.keys
-                ));
+                )));
             }
         }
     }
@@ -145,7 +170,7 @@ pub struct Keymap {
 impl Keymap {
     /// Merges the preset and user layers: a user binding replaces every
     /// preset binding in the same scope that it equals, extends or prefixes.
-    pub fn build(preset: Vec<Entry>, user: Vec<Entry>) -> Result<Keymap, String> {
+    pub fn build(preset: Vec<Entry>, user: Vec<Entry>) -> Result<Keymap, KeymapError> {
         check_layer(&preset)?;
         check_layer(&user)?;
         let mut merged = preset;
@@ -174,12 +199,11 @@ impl Keymap {
             };
             let mut found = true;
             for chord in seq {
-                match node.children.get(chord) {
-                    Some(n) => node = n,
-                    None => {
-                        found = false;
-                        break;
-                    }
+                if let Some(n) = node.children.get(chord) {
+                    node = n;
+                } else {
+                    found = false;
+                    break;
                 }
             }
             if !found || seq.is_empty() {
@@ -312,7 +336,7 @@ mod tests {
                 cmd(Scope::List, "Ctrl+X", "back"),
             ],
         );
-        assert!(dup.err().unwrap().contains("same keys"));
+        assert!(dup.err().unwrap().to_string().contains("same keys"));
         let prefix = Keymap::build(
             vec![],
             vec![
@@ -321,7 +345,11 @@ mod tests {
             ],
         );
         let err = prefix.err().unwrap();
-        assert!(err.contains("`ctrl+g` is a prefix of `ctrl+g d`"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("`ctrl+g` is a prefix of `ctrl+g d`"),
+            "{err}"
+        );
         // Same keys in different scopes are fine.
         assert!(
             Keymap::build(

@@ -390,7 +390,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         .unwrap_or_else(default)
 }
 
-fn module() -> Result<HINSTANCE, Error> {
+/// The module handle of the process, which owns the window class.
+pub(crate) fn module() -> Result<HINSTANCE, Error> {
     // SAFETY: a null name asks for the module of the process itself.
     Ok(unsafe { GetModuleHandleW(None) }?.into())
 }
@@ -488,10 +489,6 @@ impl Window {
 
     pub(crate) fn state(&self) -> &Rc<WindowState> {
         &self.state
-    }
-
-    pub(crate) fn module(&self) -> Result<HINSTANCE, Error> {
-        module()
     }
 
     /// Shows the window the way the process was asked to start.

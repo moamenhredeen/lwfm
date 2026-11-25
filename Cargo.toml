@@ -4,6 +4,11 @@ members = ["crates/lwfm-win"]
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# `list::ListView`, `edit::EditEvent` and the like read best with their prefix.
+module_name_repetitions = "allow"
+
 [package]
 name = "lwfm"
 version = "0.1.0"

@@ -12,6 +12,8 @@ use windows::Win32::UI::WindowsAndMessaging::{MSG, WM_CHAR, WM_KEYDOWN, WM_SYSKE
 use crate::num::loword;
 
 /// Which modifier keys are held.
+// One independent flag per modifier key; no state machine hides in here.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Default, Debug)]
 pub struct ModState {
     pub ctrl: bool,

@@ -1,5 +1,5 @@
 //! Finding the config file: `--config`, `LWFM_CONFIG`, then the dotfile and
-//! AppData locations.
+//! `AppData` locations.
 
 use std::path::{Path, PathBuf};
 
@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 #[derive(Default, Clone, Debug)]
 pub struct Env {
     pub explicit: Option<PathBuf>,
-    pub env_var: Option<PathBuf>,
+    /// The path in `LWFM_CONFIG`.
+    pub variable: Option<PathBuf>,
     pub userprofile: Option<PathBuf>,
     pub appdata: Option<PathBuf>,
 }
@@ -21,7 +22,7 @@ impl Env {
         };
         Env {
             explicit,
-            env_var: var("LWFM_CONFIG"),
+            variable: var("LWFM_CONFIG"),
             userprofile: var("USERPROFILE"),
             appdata: var("APPDATA"),
         }
@@ -44,7 +45,7 @@ pub enum Found {
 }
 
 pub fn discover(env: &Env, exists: &dyn Fn(&Path) -> bool) -> Found {
-    if let Some(named) = env.explicit.as_ref().or(env.env_var.as_ref()) {
+    if let Some(named) = env.explicit.as_ref().or(env.variable.as_ref()) {
         return if exists(named) {
             Found::File(named.clone())
         } else {
@@ -71,7 +72,7 @@ mod tests {
     fn env() -> Env {
         Env {
             explicit: None,
-            env_var: None,
+            variable: None,
             userprofile: Some(r"C:\Users\me".into()),
             appdata: Some(r"C:\Users\me\AppData\Roaming".into()),
         }
@@ -97,9 +98,9 @@ mod tests {
     }
 
     #[test]
-    fn env_var_before_locations() {
+    fn variable_before_locations() {
         let e = Env {
-            env_var: Some(r"D:\env.lua".into()),
+            variable: Some(r"D:\env.lua".into()),
             ..env()
         };
         assert_eq!(

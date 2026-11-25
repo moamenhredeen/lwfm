@@ -52,7 +52,7 @@ fn create_child(
             0,
             Some(parent),
             Some(HMENU(std::ptr::without_provenance_mut(id))),
-            Some(window.module()?),
+            Some(crate::window::module()?),
             None,
         )
     }?;

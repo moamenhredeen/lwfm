@@ -5,7 +5,7 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use super::{App, Event};
-use crate::config::{self, Loaded, watch};
+use crate::config::{self, ConfigError, Loaded, watch};
 use crate::trace;
 
 pub(super) struct ConfigState {
@@ -40,8 +40,8 @@ impl App {
     }
 
     pub(super) fn watch_config(&self, path: PathBuf) {
-        let watched = self.with_config(|c| c.watcher.as_ref().is_some_and(|w| w.path == path));
-        if watched {
+        let already = self.with_config(|c| c.watcher.as_ref().is_some_and(|w| w.path == path));
+        if already {
             return;
         }
         let waker = self.waker.clone();
@@ -52,7 +52,7 @@ impl App {
     }
 
     /// New content of the config file arrived (or reading it failed).
-    pub(super) fn on_config_changed(&self, path: PathBuf, source: Result<String, String>) {
+    pub(super) fn on_config_changed(&self, path: PathBuf, source: Result<String, ConfigError>) {
         let started = Instant::now();
         let loaded = source.and_then(|src| config::load(Some(&path), Some(&src)));
         trace::log(|| {
@@ -82,7 +82,7 @@ impl App {
                 self.watch_config(path);
                 self.set_message(msg);
             }
-            Err(e) => self.set_message(e),
+            Err(e) => self.set_message(e.to_string()),
         }
     }
 

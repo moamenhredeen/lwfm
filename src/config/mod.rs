@@ -5,7 +5,8 @@ pub mod discover;
 pub mod schema;
 pub mod watch;
 
-use std::path::Path;
+use std::fmt;
+use std::path::{Path, PathBuf};
 
 use lwfm_win::Color;
 use mlua::{Lua, Value};
@@ -13,7 +14,9 @@ use mlua::{Lua, Value};
 use crate::cmd::registry::{self, Invocation};
 use crate::fs::model::Sort;
 use crate::keys::keymap::{Binding, Keymap};
-use crate::lua::{self, api};
+use crate::lua::{self, ScriptError, api};
+
+pub use schema::SettingError;
 
 pub const STARTER: &str = include_str!("starter.lua");
 
@@ -55,8 +58,46 @@ pub struct Loaded {
     pub warnings: Vec<String>,
 }
 
-fn short(e: mlua::Error) -> String {
-    lua::short_error(&e)
+/// Why a configuration could not be loaded.
+#[derive(Debug)]
+pub enum ConfigError {
+    /// The config file could not be read.
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    /// Lua failed to evaluate the script.
+    Script(ScriptError),
+    /// The script ran, but what it returned is not a valid configuration.
+    Invalid { file: String, source: SettingError },
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConfigError::Read { path, source } => {
+                write!(f, "cannot read {}: {source}", path.display())
+            }
+            ConfigError::Script(e) => e.fmt(f),
+            ConfigError::Invalid { file, source } => write!(f, "{file}: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ConfigError::Read { source, .. } => Some(source),
+            ConfigError::Script(e) => Some(e),
+            ConfigError::Invalid { source, .. } => Some(source),
+        }
+    }
+}
+
+// By value, so that it can be passed to `map_err` directly.
+#[allow(clippy::needless_pass_by_value)]
+fn short(e: mlua::Error) -> ConfigError {
+    ConfigError::Script(ScriptError::from(&e))
 }
 
 /// Built-in defaults: the explorer preset with no config file.
@@ -66,7 +107,7 @@ pub fn defaults() -> Loaded {
 
 /// Evaluates `source` (the content of `path`) or, without a source, the
 /// explorer preset.
-pub fn load(path: Option<&Path>, source: Option<&str>) -> Result<Loaded, String> {
+pub fn load(path: Option<&Path>, source: Option<&str>) -> Result<Loaded, ConfigError> {
     let name = path.and_then(Path::file_name).map_or_else(
         || "config.lua".to_string(),
         |n| n.to_string_lossy().into_owned(),
@@ -83,16 +124,20 @@ pub fn load(path: Option<&Path>, source: Option<&str>) -> Result<Loaded, String>
             match value {
                 Value::Table(t) => t,
                 other => {
-                    return Err(format!(
-                        "{name}: the script must return a table (got {})",
-                        other.type_name()
-                    ));
+                    return Err(ConfigError::Invalid {
+                        file: name,
+                        source: SettingError::new(format!(
+                            "the script must return a table (got {})",
+                            other.type_name()
+                        )),
+                    });
                 }
             }
         }
         None => api::preset(&lua, "explorer").map_err(short)?,
     };
-    let read = schema::read(&cfg, &preset).map_err(|e| format!("{name}: {e}"))?;
+    let read = schema::read(&cfg, &preset)
+        .map_err(|source| ConfigError::Invalid { file: name, source })?;
     let handlers = api::handlers(&lua).map_err(short)?;
     Ok(Loaded {
         lua,
@@ -106,8 +151,11 @@ pub fn load(path: Option<&Path>, source: Option<&str>) -> Result<Loaded, String>
 
 /// Reads a config file as text. Called before the window exists and on the
 /// watcher thread, never on the UI thread of a running window.
-pub fn read_file(path: &Path) -> Result<String, String> {
-    std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))
+pub fn read_file(path: &Path) -> Result<String, ConfigError> {
+    std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 #[cfg(test)]
@@ -117,7 +165,7 @@ mod tests {
     use crate::keys::keymap::{Action, Lookup, Scope, parse_seq};
 
     fn cfg(src: &str) -> Result<Loaded, String> {
-        load(Some(Path::new(r"C:\cfg\config.lua")), Some(src))
+        load(Some(Path::new(r"C:\cfg\config.lua")), Some(src)).map_err(|e| e.to_string())
     }
 
     fn bound(l: &Loaded, scope: Scope, keys: &str) -> Option<String> {
@@ -308,7 +356,7 @@ mod tests {
                 .err()
                 .unwrap();
         assert!(e.contains("`ctrl+g` is a prefix of `ctrl+g d`"), "{e}");
-        let e = cfg(r#"return { keys = { lsit = {} } }"#).err().unwrap();
+        let e = cfg(r"return { keys = { lsit = {} } }").err().unwrap();
         assert!(e.contains("keys.lsit: unknown scope"), "{e}");
         let e = cfg(r#"return { keys = { list = { ["ctrl+foo"] = "up" } } }"#)
             .err()

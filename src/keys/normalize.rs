@@ -1,7 +1,7 @@
 //! Turns keyboard events into chords.
 //!
 //! Named keys and ctrl/alt/win combinations are resolved from the key on
-//! key-down. Everything else waits for the character event, so shift, AltGr
+//! key-down. Everything else waits for the character event, so shift, `AltGr`
 //! and dead keys are already applied by the keyboard layout.
 
 use lwfm_win::input::{KeyCode, ModState, NamedKey, VirtualKey};

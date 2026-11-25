@@ -16,6 +16,8 @@ impl fmt::Display for CmdError {
     }
 }
 
+impl std::error::Error for CmdError {}
+
 impl From<parse::ParseError> for CmdError {
     fn from(e: parse::ParseError) -> CmdError {
         CmdError(e.0)
@@ -198,7 +200,7 @@ static COMMANDS: &[CommandDef] = &[
         }],
         desc: "Sort the list by a column",
         run: |t, a| {
-            let key = SortKey::from_name(a.arg(0)).expect("validated by compile");
+            let key: SortKey = a.arg(0).parse().expect("validated by compile");
             t.sort(Sort {
                 key,
                 reverse: a.flag("reverse"),
@@ -395,6 +397,8 @@ pub mod testing {
             self.0.borrow().clone()
         }
 
+        // Returns `Ok` so that every `Target` method can end with it.
+        #[allow(clippy::unnecessary_wraps)]
         fn log(&self, s: impl Into<String>) -> CmdResult {
             self.0.borrow_mut().push(s.into());
             Ok(())
@@ -499,7 +503,7 @@ mod tests {
     fn unknown_command() {
         let r = Recorder::default();
         assert_eq!(run_str(&r, "cpoy").unwrap_err().0, "unknown command `cpoy`");
-        assert!(r.calls().is_empty());
+        assert_eq!(r.calls(), Vec::<String>::new());
     }
 
     #[test]

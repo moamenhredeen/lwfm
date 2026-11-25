@@ -193,7 +193,8 @@ Borrow rule, unchanged in substance and now documented on the types: `Listing` a
 No error crate is added; the types are small and hand-written.
 
 - `ParseError`, `CmdError`, `ChordError`: implement `std::error::Error`.
-- `config`: `Result<_, String>` becomes `Result<_, ConfigError>` with variants `Read { path, source }`, `Script(String)` and `Setting { path, expected }`. `Display` reproduces today's texts exactly, because they are asserted by tests and described in the lua-config spec.
+- `config`: `Result<_, String>` becomes `Result<_, ConfigError>` with variants `Read { path, source }`, `Script(ScriptError)` and `Invalid { file, source: SettingError }`. `SettingError` carries the message with its dotted path as text: the roughly thirty validation messages do not share one `path`/`expected` shape, and no caller tells them apart. `Display` reproduces today's texts exactly, because they are asserted by tests and described in the lua-config spec.
+- `lua`: `api::call` returns `ScriptError` (the one-line form of a Lua error) instead of `String`; `shell::expand` returns `ExpandError`.
 - `keys::keymap`: `Result<_, String>` becomes `Result<_, KeymapError>`, wrapped by `ConfigError`.
 - Enumeration: `Result<(), u32>` becomes `Result<(), lwfm_win::Error>`.
 - Thread spawn failure for enumeration is reported as a load error instead of a panic.

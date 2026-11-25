@@ -197,12 +197,9 @@ impl App {
                     let first =
                         self.listing_mut(|l| !std::mem::replace(&mut l.startup_fired, true));
                     if first {
-                        self.fire(LuaEvent::Startup, vec![]);
+                        self.fire(LuaEvent::Startup, &[]);
                     }
-                    self.fire(
-                        LuaEvent::DirEnter,
-                        vec![self.base_dir().display().to_string()],
-                    );
+                    self.fire(LuaEvent::DirEnter, &[self.base_dir().display().to_string()]);
                 }
             }
             FsMsg::Error {

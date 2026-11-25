@@ -147,6 +147,8 @@ impl fmt::Display for ChordError {
     }
 }
 
+impl std::error::Error for ChordError {}
+
 impl std::str::FromStr for Chord {
     type Err = ChordError;
 

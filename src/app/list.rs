@@ -103,21 +103,20 @@ impl App {
         });
         self.ui.list.set_count(count);
 
-        let found = match keep {
-            Some(sel) => self.apply_selection(&sel),
-            None => {
-                let target = self.listing_mut(|l| l.restore.take()).unwrap_or_default();
-                let found = self.apply_selection(&target);
-                if !found {
-                    // Not listed yet: keep waiting while loading.
-                    self.listing_mut(|l| {
-                        if l.load.is_loading() {
-                            l.restore = Some(target);
-                        }
-                    });
-                }
-                found
+        let found = if let Some(sel) = keep {
+            self.apply_selection(&sel)
+        } else {
+            let target = self.listing_mut(|l| l.restore.take()).unwrap_or_default();
+            let found = self.apply_selection(&target);
+            if !found {
+                // Not listed yet: keep waiting while loading.
+                self.listing_mut(|l| {
+                    if l.load.is_loading() {
+                        l.restore = Some(target);
+                    }
+                });
             }
+            found
         };
         if !found && count > 0 {
             // Always show a cursor; it lands on the first entry.

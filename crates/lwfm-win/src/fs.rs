@@ -175,7 +175,7 @@ fn list_bulk(dir: &Path, sink: &mut Sink<'_>) -> Result<(), Error> {
     }
 }
 
-/// Reads the FILE_FULL_DIR_INFO record at byte `offset` of `buf`, returning
+/// Reads the `FILE_FULL_DIR_INFO` record at byte `offset` of `buf`, returning
 /// it with the distance to the next record (0 for the last). `None` when the
 /// record would not lie inside the buffer.
 fn full_dir_record(buf: &[u64], offset: usize) -> Option<(RawEntry<'_>, usize)> {
@@ -387,7 +387,7 @@ fn watch_loop(
     }
 }
 
-/// Decodes the chain of FILE_NOTIFY_INFORMATION records in the first
+/// Decodes the chain of `FILE_NOTIFY_INFORMATION` records in the first
 /// `filled` bytes of `buf`.
 fn changed_paths(buf: &[u64], filled: usize) -> Vec<PathBuf> {
     let filled = filled.min(size_of_val(buf));

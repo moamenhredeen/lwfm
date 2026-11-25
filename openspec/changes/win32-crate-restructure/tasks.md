@@ -50,9 +50,9 @@ Every group ends green (`cargo clippy --all-targets -- -D warnings`, `cargo fmt 
 
 ## 7. Errors and idioms
 
-- [ ] 7.1 Implement `std::error::Error` for `ParseError`, `CmdError` and `ChordError`; introduce `KeymapError` and `ConfigError` with `Display` texts identical to today's; verify the existing config, schema and keymap tests pass unchanged
-- [ ] 7.2 Replace lossy `as` casts with `From`/`TryFrom` or the documented helpers, wildcard `windows` imports with explicit lists, and the `COLUMNS` tuple with a struct; implement `FromStr` for `SortKey` and `Scope`; verify `cargo clippy --all-targets -- -W clippy::pedantic` reports no cast, pointer or wildcard-import warnings
-- [ ] 7.3 Settle the pedantic allow list in `[workspace.lints]` and turn pedantic into a denied group; verify `cargo clippy --all-targets -- -D warnings` passes and every `unsafe` block in `lwfm-win` has a `// SAFETY:` comment (enforced by the lint); commit
+- [x] 7.1 Implement `std::error::Error` for `ParseError`, `CmdError` and `ChordError`; introduce `KeymapError` and `ConfigError` with `Display` texts identical to today's; verify the existing config, schema and keymap tests pass unchanged (the `Display` texts are unchanged; three test helpers convert the typed error with `to_string()`, and `shell::expand` got an `ExpandError` too)
+- [x] 7.2 Replace lossy `as` casts with `From`/`TryFrom` or the documented helpers, wildcard `windows` imports with explicit lists, and the `COLUMNS` tuple with a struct; implement `FromStr` for `SortKey` and `Scope`; verify `cargo clippy --all-targets -- -W clippy::pedantic` reports no cast, pointer or wildcard-import warnings
+- [x] 7.3 Settle the pedantic allow list in `[workspace.lints]` and turn pedantic into a denied group; verify `cargo clippy --all-targets -- -D warnings` passes and every `unsafe` block in `lwfm-win` has a `// SAFETY:` comment (enforced by the lint); commit (the only allowed pedantic lint is `module_name_repetitions`; three item-level `#[allow]`s carry their reason)
 
 ## 8. Verification and project rules
 

@@ -3,6 +3,7 @@
 //! warnings.
 
 use std::collections::HashMap;
+use std::fmt;
 
 use lwfm_win::Color;
 use mlua::{Table, Value};
@@ -11,7 +12,37 @@ use super::Settings;
 use crate::cmd::registry;
 use crate::fs::model::SortKey;
 use crate::keys::chord::Chord;
-use crate::keys::keymap::{Action, Binding, Entry, Keymap, Scope, parse_seq};
+use crate::keys::keymap::{Action, Binding, Entry, Keymap, KeymapError, Scope, parse_seq};
+
+/// A setting with a wrong type or value, described with its dotted path.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SettingError(String);
+
+impl SettingError {
+    pub fn new(message: String) -> SettingError {
+        SettingError(message)
+    }
+}
+
+impl From<String> for SettingError {
+    fn from(message: String) -> SettingError {
+        SettingError(message)
+    }
+}
+
+impl From<KeymapError> for SettingError {
+    fn from(e: KeymapError) -> SettingError {
+        SettingError(e.to_string())
+    }
+}
+
+impl fmt::Display for SettingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SettingError {}
 
 pub struct Read {
     pub settings: Settings,
@@ -31,7 +62,7 @@ fn key_name(k: &Value) -> Result<String, String> {
 }
 
 /// `(key, value)` pairs of a table, with string keys, in a stable order.
-fn pairs(t: &Table, path: &str) -> Result<Vec<(String, Value)>, String> {
+fn pairs(t: &Table, path: &str) -> Result<Vec<(String, Value)>, SettingError> {
     let mut out = Vec::new();
     for pair in t.pairs::<Value, Value>() {
         let (k, v) = pair.map_err(|e| format!("{path}: {e}"))?;
@@ -48,44 +79,44 @@ fn pairs(t: &Table, path: &str) -> Result<Vec<(String, Value)>, String> {
     Ok(out)
 }
 
-fn table<'a>(v: &'a Value, path: &str) -> Result<&'a Table, String> {
+fn table<'a>(v: &'a Value, path: &str) -> Result<&'a Table, SettingError> {
     match v {
         Value::Table(t) => Ok(t),
-        other => Err(format!(
+        other => Err(SettingError(format!(
             "{path}: expected a table, got {}",
             other.type_name()
-        )),
+        ))),
     }
 }
 
-fn string(v: &Value, path: &str) -> Result<String, String> {
+fn string(v: &Value, path: &str) -> Result<String, SettingError> {
     match v {
         Value::String(s) => Ok(s.to_str().map_err(|e| format!("{path}: {e}"))?.to_string()),
-        other => Err(format!(
+        other => Err(SettingError(format!(
             "{path}: expected a string, got {}",
             other.type_name()
-        )),
+        ))),
     }
 }
 
-fn boolean(v: &Value, path: &str) -> Result<bool, String> {
+fn boolean(v: &Value, path: &str) -> Result<bool, SettingError> {
     match v {
         Value::Boolean(b) => Ok(*b),
-        other => Err(format!(
+        other => Err(SettingError(format!(
             "{path}: expected true or false, got {}",
             other.type_name()
-        )),
+        ))),
     }
 }
 
 /// A key or opener value: command string, list of commands, Lua function,
 /// or `{ run = ..., desc = ... }`. `Ok(None)` is `noop`.
-fn action(v: &Value, path: &str) -> Result<Option<Binding>, String> {
+fn action(v: &Value, path: &str) -> Result<Option<Binding>, SettingError> {
     let commands = |cmds: Vec<String>, desc: Option<String>| {
         let refs: Vec<&str> = cmds.iter().map(String::as_str).collect();
         Binding::commands(&refs, desc.as_deref())
             .map(Some)
-            .map_err(|e| format!("{path}: {e}"))
+            .map_err(|e| SettingError(format!("{path}: {e}")))
     };
     match v {
         Value::String(_) => {
@@ -108,15 +139,15 @@ fn action(v: &Value, path: &str) -> Result<Option<Binding>, String> {
                     .enumerate()
                     .map(|(i, c)| {
                         string(
-                            &c.map_err(|e| e.to_string())?,
+                            &c.map_err(|e| SettingError(e.to_string()))?,
                             &format!("{path}[{}]", i + 1),
                         )
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 if cmds.is_empty() {
-                    return Err(format!(
+                    return Err(SettingError(format!(
                         "{path}: expected a command, a list of commands, a function or {{ run = ... }}"
-                    ));
+                    )));
                 }
                 return commands(cmds, None);
             }
@@ -131,10 +162,10 @@ fn action(v: &Value, path: &str) -> Result<Option<Binding>, String> {
             }
             Ok(Some(b))
         }
-        other => Err(format!(
+        other => Err(SettingError(format!(
             "{path}: expected a command, a list of commands, a function or {{ run = ... }}, got {}",
             other.type_name()
-        )),
+        ))),
     }
 }
 
@@ -153,10 +184,10 @@ fn fingerprint(v: &Value) -> Option<String> {
 
 type Layer = Vec<(Scope, String, Value)>;
 
-fn key_layer(keys: &Value, path: &str) -> Result<Layer, String> {
+fn key_layer(keys: &Value, path: &str) -> Result<Layer, SettingError> {
     let mut out = Vec::new();
     for (scope_name, scope_tbl) in pairs(table(keys, path)?, path)? {
-        let scope = Scope::from_name(&scope_name).ok_or_else(|| {
+        let scope: Scope = scope_name.parse().map_err(|_| {
             format!(
                 "{path}.{scope_name}: unknown scope (expected {})",
                 Scope::NAMES.join(", ")
@@ -170,18 +201,18 @@ fn key_layer(keys: &Value, path: &str) -> Result<Layer, String> {
     Ok(out)
 }
 
-fn entries(layer: Layer) -> Result<Vec<Entry>, String> {
+fn entries(layer: Layer) -> Result<Vec<Entry>, SettingError> {
     layer
         .into_iter()
         .map(|(scope, keys, v)| {
             let path = format!("keys.{}[\"{keys}\"]", scope.name());
             Entry::new(scope, &keys, action(&v, &path)?)
-                .map_err(|e| format!("keys.{}: {e}", scope.name()))
+                .map_err(|e| SettingError(format!("keys.{}: {e}", scope.name())))
         })
         .collect()
 }
 
-pub fn read(cfg: &Table, preset: &Table) -> Result<Read, String> {
+pub fn read(cfg: &Table, preset: &Table) -> Result<Read, SettingError> {
     let mut settings = Settings::default();
     let mut warnings = Vec::new();
     let mut user_keys = Layer::new();
@@ -195,7 +226,7 @@ pub fn read(cfg: &Table, preset: &Table) -> Result<Read, String> {
                     match k.as_str() {
                         "key" => {
                             let s = string(&sv, "sort.key")?;
-                            settings.sort.key = SortKey::from_name(&s).ok_or_else(|| {
+                            settings.sort.key = s.parse().map_err(|_| {
                                 format!(
                                     "sort.key: expected one of {}, got `{s}`",
                                     SortKey::NAMES.join(", ")

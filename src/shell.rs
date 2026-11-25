@@ -1,6 +1,7 @@
 //! External commands: `$f`/`$fs`/`$d` expansion, opener patterns, and
 //! launching command lines through `cmd.exe` off the UI thread.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use lwfm_win::process;
@@ -34,9 +35,26 @@ fn quoted(p: &Path) -> String {
     format!("\"{}\"", p.display())
 }
 
+/// Why a command line could not be expanded.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ExpandError {
+    /// `$f` or `$fs` was used while no entry is focused.
+    NoFocus,
+}
+
+impl fmt::Display for ExpandError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ExpandError::NoFocus => f.write_str("no entry is focused"),
+        }
+    }
+}
+
+impl std::error::Error for ExpandError {}
+
 /// Substitutes `$f`, `$fs`, `$d` and `$$` in a command line.
-pub fn expand(line: &str, ctx: &Context) -> Result<String, String> {
-    let no_focus = || "no entry is focused".to_string();
+pub fn expand(line: &str, ctx: &Context) -> Result<String, ExpandError> {
+    let no_focus = || ExpandError::NoFocus;
     let mut out = String::with_capacity(line.len());
     let mut rest = line;
     while let Some(i) = rest.find('$') {
@@ -142,7 +160,9 @@ mod tests {
     #[test]
     fn nothing_focused() {
         let c = ctx(None, &[]);
-        assert_eq!(expand("notepad $f", &c).unwrap_err(), "no entry is focused");
+        let err = expand("notepad $f", &c).unwrap_err();
+        assert_eq!(err, ExpandError::NoFocus);
+        assert_eq!(err.to_string(), "no entry is focused");
         assert!(expand("x $fs", &c).is_err());
         assert!(expand("x $d", &c).is_ok());
     }

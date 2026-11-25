@@ -46,9 +46,7 @@ pub fn parent(p: &Path) -> Option<PathBuf> {
 }
 
 pub fn home() -> PathBuf {
-    std::env::var_os("USERPROFILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("C:\\"))
+    std::env::var_os("USERPROFILE").map_or_else(|| PathBuf::from("C:\\"), PathBuf::from)
 }
 
 #[cfg(test)]

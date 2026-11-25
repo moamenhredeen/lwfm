@@ -14,6 +14,8 @@ impl fmt::Display for ParseError {
     }
 }
 
+impl std::error::Error for ParseError {}
+
 #[derive(Debug, PartialEq, Eq, Clone, Default)]
 pub struct Parsed {
     pub name: String,

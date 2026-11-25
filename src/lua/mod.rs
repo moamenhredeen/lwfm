@@ -3,6 +3,7 @@
 
 pub mod api;
 
+use std::fmt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -74,12 +75,31 @@ pub fn with_limit<R>(
     result
 }
 
-/// One-line description of a Lua error for the status bar.
+/// A Lua error reduced to one line for the status bar.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ScriptError(String);
+
+impl From<&mlua::Error> for ScriptError {
+    fn from(e: &mlua::Error) -> ScriptError {
+        ScriptError(short_error(e))
+    }
+}
+
+impl fmt::Display for ScriptError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ScriptError {}
+
+/// One-line description of a Lua error.
 pub fn short_error(e: &mlua::Error) -> String {
-    use mlua::Error::*;
+    use mlua::Error::{
+        CallbackError, ExternalError, MemoryError, RuntimeError, SyntaxError, WithContext,
+    };
     match e {
-        CallbackError { cause, .. } => short_error(cause),
-        WithContext { cause, .. } => short_error(cause),
+        CallbackError { cause, .. } | WithContext { cause, .. } => short_error(cause),
         SyntaxError { message, .. } => first_line(message),
         RuntimeError(m) | MemoryError(m) => first_line(m),
         ExternalError(err) => first_line(&err.to_string()),

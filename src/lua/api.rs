@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 use mlua::{Function, Lua, Table, Value, Variadic};
 
+use super::ScriptError;
 use crate::cmd::registry::{self, CmdError, Target};
 
 pub const EXPLORER: &str = include_str!("../config/explorer.lua");
@@ -149,8 +150,8 @@ pub fn call(
     host: &dyn Host,
     state: &FmState,
     f: &Function,
-    extra: Vec<String>,
-) -> Result<(), String> {
+    extra: &[String],
+) -> Result<(), ScriptError> {
     let run = || {
         lua.scope(|scope| {
             let fm = lua.create_table()?;
@@ -185,13 +186,13 @@ pub fn call(
                 fm.set(name.replace('-', "_"), method)?;
             }
             let mut args: Vec<Value> = vec![Value::Table(fm)];
-            for e in &extra {
+            for e in extra {
                 args.push(Value::String(lua.create_string(e)?));
             }
             f.call::<()>(Variadic::from_iter(args))
         })
     };
-    super::with_limit(lua, super::CALL_LIMIT, run).map_err(|e| super::short_error(&e))
+    super::with_limit(lua, super::CALL_LIMIT, run).map_err(|e| ScriptError::from(&e))
 }
 
 #[cfg(test)]
@@ -218,7 +219,7 @@ mod tests {
         install(&lua).unwrap();
         let f: Function = lua.load(src).eval().unwrap();
         let r = Recorder::default();
-        let res = call(&lua, &r, &state(), &f, vec![]);
+        let res = call(&lua, &r, &state(), &f, &[]).map_err(|e| e.to_string());
         (r.calls(), res)
     }
 

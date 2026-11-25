@@ -3,6 +3,7 @@
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
+use std::str::FromStr;
 
 use super::entry::Entry;
 use crate::search::Query;
@@ -17,15 +18,6 @@ pub enum SortKey {
 impl SortKey {
     pub const NAMES: &'static [&'static str] = &["name", "size", "mtime"];
 
-    pub fn from_name(s: &str) -> Option<SortKey> {
-        match s {
-            "name" => Some(SortKey::Name),
-            "size" => Some(SortKey::Size),
-            "mtime" => Some(SortKey::Mtime),
-            _ => None,
-        }
-    }
-
     pub fn name(self) -> &'static str {
         match self {
             SortKey::Name => "name",
@@ -38,6 +30,23 @@ impl SortKey {
         [SortKey::Name, SortKey::Size, SortKey::Mtime]
             .get(column)
             .copied()
+    }
+}
+
+/// The text is not one of [`SortKey::NAMES`].
+#[derive(Debug, PartialEq, Eq)]
+pub struct UnknownSortKey;
+
+impl FromStr for SortKey {
+    type Err = UnknownSortKey;
+
+    fn from_str(s: &str) -> Result<SortKey, UnknownSortKey> {
+        match s {
+            "name" => Ok(SortKey::Name),
+            "size" => Ok(SortKey::Size),
+            "mtime" => Ok(SortKey::Mtime),
+            _ => Err(UnknownSortKey),
+        }
     }
 }
 
@@ -93,9 +102,11 @@ impl Model {
         let show_hidden = self.show_hidden;
         let Sort { key, reverse } = self.sort;
         self.visible.clear();
-        self.visible.extend(
-            (0..entries.len() as u32).filter(|&i| show_hidden || !entries[i as usize].is_hidden()),
-        );
+        // Indices are u32 to halve the view's memory; a directory with more
+        // entries than that is cut off here instead of wrapping around.
+        let count = u32::try_from(entries.len()).unwrap_or(u32::MAX);
+        self.visible
+            .extend((0..count).filter(|&i| show_hidden || !entries[i as usize].is_hidden()));
         self.visible.sort_by(|&a, &b| {
             let (a, b) = (&entries[a as usize], &entries[b as usize]);
             b.is_dir().cmp(&a.is_dir()).then_with(|| {

@@ -119,8 +119,8 @@ impl App {
             }
             Action::Lua(f) => {
                 let state = self.fm_state();
-                if let Err(e) = api::call(&config.lua, self, &state, f, vec![]) {
-                    self.set_message(e);
+                if let Err(e) = api::call(&config.lua, self, &state, f, &[]) {
+                    self.set_message(e.to_string());
                 }
             }
         }
@@ -133,15 +133,15 @@ impl App {
     }
 
     /// Calls the Lua handlers registered for `event`.
-    pub(super) fn fire(&self, event: LuaEvent, extra: Vec<String>) {
+    pub(super) fn fire(&self, event: LuaEvent, extra: &[String]) {
         let config = self.config();
         let Some(handlers) = config.handlers.get(&event) else {
             return;
         };
         for f in handlers {
             let state = self.fm_state();
-            if let Err(e) = api::call(&config.lua, self, &state, f, extra.clone()) {
-                self.set_message(e);
+            if let Err(e) = api::call(&config.lua, self, &state, f, extra) {
+                self.set_message(e.to_string());
             }
         }
     }

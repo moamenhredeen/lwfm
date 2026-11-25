@@ -43,6 +43,8 @@ pub fn format_size(bytes: u64) -> String {
     if bytes < 1024 {
         return format!("{bytes} B");
     }
+    // Rounded to two significant digits below, so the precision of f64 is ample.
+    #[allow(clippy::cast_precision_loss)]
     let mut value = bytes as f64 / 1024.0;
     let mut unit = 0;
     while value >= 1024.0 && unit < UNITS.len() - 1 {

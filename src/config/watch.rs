@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 use lwfm_win::fs::DirWatcher;
 
+use super::ConfigError;
+
 const DEBOUNCE: Duration = Duration::from_millis(100);
 /// Identical content within this window comes from events buffered during the debounce.
 const DUPLICATE_WINDOW: Duration = Duration::from_millis(500);
@@ -42,13 +44,14 @@ fn relevant(rel: &str, file_name: &str) -> bool {
 /// path and its new content (or a read error).
 pub fn watch(
     path: PathBuf,
-    on_change: impl Fn(PathBuf, Result<String, String>) + Send + 'static,
+    on_change: impl Fn(PathBuf, Result<String, ConfigError>) + Send + 'static,
 ) -> Option<Watcher> {
     let dir = path.parent()?.to_path_buf();
     let file_name = path.file_name()?.to_string_lossy().into_owned();
     let stop = Arc::new(AtomicBool::new(false));
     let stopped = stop.clone();
     let file = path.clone();
+    // What was reported last and when; a read error is kept as its text.
     let mut last_sent: Option<(Instant, Result<String, String>)> = None;
     let dir_watcher = DirWatcher::start(&dir, move |changed| {
         let rel = |p: &PathBuf| Path::to_string_lossy(p).into_owned();
@@ -66,11 +69,15 @@ pub fn watch(
         let content = super::read_file(&file);
         // Events buffered during the debounce report the same config
         // content again; module edits change other files, so they always reload.
+        let seen = content
+            .as_ref()
+            .map(String::clone)
+            .map_err(ToString::to_string);
         let duplicate = last_sent
             .as_ref()
-            .is_some_and(|(at, c)| at.elapsed() < DUPLICATE_WINDOW && *c == content);
+            .is_some_and(|(at, c)| at.elapsed() < DUPLICATE_WINDOW && *c == seen);
         if module || !duplicate {
-            last_sent = Some((Instant::now(), content.clone()));
+            last_sent = Some((Instant::now(), seen));
             on_change(file.clone(), content);
         }
     })

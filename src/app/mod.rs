@@ -37,8 +37,8 @@ use self::keys::KeySeq;
 use self::list::{RebuildTimer, TraceState};
 use self::nav::{Listing, Nav, NavKind};
 use self::search::SearchState;
-use crate::config::Loaded;
 use crate::config::discover::Env;
+use crate::config::{ConfigError, Loaded};
 use crate::fs::enumerate::FsMsg;
 use crate::fs::path;
 use crate::trace;
@@ -116,7 +116,7 @@ enum Event {
     Fs(FsMsg),
     Message(String),
     /// New content of the watched config file (or a read error).
-    ConfigChanged(PathBuf, Result<String, String>),
+    ConfigChanged(PathBuf, Result<String, ConfigError>),
     /// `edit-config` made sure the file exists; `created` if it wrote the starter.
     ConfigReady {
         path: PathBuf,
