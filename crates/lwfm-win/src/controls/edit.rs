@@ -39,8 +39,8 @@ pub struct Edit {
 }
 
 impl Edit {
-    /// Creates the input as a child of `window`, on top of the controls
-    /// created before it.
+    /// Creates the input as a child of `window`. It lies below the controls
+    /// created before it until [`show_on_top`](Edit::show_on_top) raises it.
     ///
     /// # Errors
     ///

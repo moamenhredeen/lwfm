@@ -89,13 +89,6 @@ pub trait Handler {
 pub struct WindowToken(isize);
 
 impl WindowToken {
-    /// Temporary bridge while the application still creates its own window.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn from_raw(hwnd: isize) -> WindowToken {
-        WindowToken(hwnd)
-    }
-
     fn of(hwnd: HWND) -> WindowToken {
         WindowToken(hwnd.0.addr().cast_signed())
     }
@@ -524,7 +517,7 @@ impl Window {
         let mut rect = RECT::default();
         // SAFETY: `rect` is writable.
         let _ = unsafe { GetClientRect(self.state.hwnd, &raw mut rect) };
-        Size::from(rect)
+        Size::of(rect)
     }
 
     /// Starts (or restarts) a timer that raises [`WindowEvent::Timer`]

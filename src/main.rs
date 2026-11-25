@@ -1,4 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![forbid(unsafe_code)]
 
 mod app;
 mod cmd;
@@ -10,7 +11,6 @@ mod nav;
 mod search;
 mod shell;
 mod trace;
-mod ui;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -118,7 +118,7 @@ fn main() {
         env,
         message,
     };
-    let code = match ui::window::run(startup) {
+    let code = match app::run(startup) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("lwfm: {e}");

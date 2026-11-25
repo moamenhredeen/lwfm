@@ -30,8 +30,8 @@ pub struct Size {
     pub height: i32,
 }
 
-impl From<RECT> for Size {
-    fn from(r: RECT) -> Size {
+impl Size {
+    pub(crate) fn of(r: RECT) -> Size {
         Size {
             width: r.right - r.left,
             height: r.bottom - r.top,

@@ -99,7 +99,6 @@ dependencies = [
  "embed-manifest",
  "lwfm-win",
  "mlua",
- "windows",
 ]
 
 [[package]]

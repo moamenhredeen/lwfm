@@ -225,6 +225,71 @@ mod tests {
     }
 
     #[test]
+    fn dpi_change_swaps_the_font_and_rescales_columns() {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::UI::Controls::LVM_GETCOLUMNWIDTH;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            WM_DPICHANGED, WM_GETFONT, WM_SETTINGCHANGE,
+        };
+
+        use crate::msg::send;
+
+        struct Events(RefCell<Vec<WindowEvent>>);
+        impl Handler for Events {
+            fn on_event(&self, event: WindowEvent) {
+                self.0.borrow_mut().push(event);
+            }
+            fn on_key(&self, _: KeyEvent) -> bool {
+                false
+            }
+            fn list_source(&self, _: ListId) -> &dyn ListSource {
+                unreachable!("no list notification is expected")
+            }
+            fn on_edit(&self, _: EditId, _: EditEvent) {}
+        }
+
+        let window = Window::create("test").unwrap();
+        let list = ListView::new(&window, ListId(1), &COLUMNS).unwrap();
+        let edit = Edit::new(&window, EditId(2), true).unwrap();
+        let font = |hwnd| send(hwnd, WM_GETFONT, 0, 0);
+        let column = || send(list.hwnd(), LVM_GETCOLUMNWIDTH, 0, 0);
+        let old = window.dpi();
+        let new = crate::Dpi(old.0 * 2);
+        let (font_before, width_before) = (font(edit.hwnd()), column());
+        assert_ne!(font_before, 0, "controls get the window font when created");
+        assert_eq!(font(list.hwnd()), font_before);
+
+        let events = Events(RefCell::new(Vec::new()));
+        window.attached(&events, || {
+            // An unrelated settings change keeps the font.
+            send(window.state().hwnd, WM_SETTINGCHANGE, 0, 0);
+            assert_eq!(font(edit.hwnd()), font_before);
+
+            let suggested = RECT {
+                left: 10,
+                top: 10,
+                right: 810,
+                bottom: 610,
+            };
+            let wparam = usize::try_from(new.0 << 16 | new.0).unwrap();
+            send_ref(window.state().hwnd, WM_DPICHANGED, wparam, &suggested);
+        });
+
+        assert_eq!(window.dpi(), new);
+        let font_after = font(edit.hwnd());
+        assert_ne!(font_after, font_before, "the font follows the new metrics");
+        assert_eq!(font(list.hwnd()), font_after);
+        assert_eq!(column(), width_before * 2);
+        let events = events.0.borrow();
+        assert!(events.contains(&WindowEvent::SettingsChanged));
+        assert!(events.contains(&WindowEvent::DpiChanged { old, new }));
+        assert!(
+            events.contains(&WindowEvent::Resized),
+            "the suggested size was applied"
+        );
+    }
+
+    #[test]
     fn status_bar_has_a_height() {
         let window = Window::create("test").unwrap();
         let status = StatusBar::new(&window, 3).unwrap();

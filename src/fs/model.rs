@@ -34,9 +34,9 @@ impl SortKey {
         }
     }
 
-    pub fn from_column(c: i32) -> Option<SortKey> {
+    pub fn from_column(column: usize) -> Option<SortKey> {
         [SortKey::Name, SortKey::Size, SortKey::Mtime]
-            .get(usize::try_from(c).ok()?)
+            .get(column)
             .copied()
     }
 }

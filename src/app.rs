@@ -1,31 +1,26 @@
 //! Application state and behaviour. All state lives on the UI thread behind
-//! `Cell`/`RefCell`; borrows are kept short and never held across calls that
-//! may re-enter the window procedure (e.g. `SendMessageW` to the list).
+//! `Cell`/`RefCell`; borrows are kept short and never held across calls into
+//! the window or its controls, which may call back into the application
+//! (the list asks for cell text while it is being changed, for example).
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::ffi::OsString;
-use std::os::windows::ffi::OsStringExt;
+use std::ops::Range;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
-use lwfm_win::process;
-use lwfm_win::window::WindowToken;
-use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Gdi::{
-    COLOR_WINDOWTEXT, CreateFontIndirectW, CreateSolidBrush, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
-    DT_VCENTER, DeleteObject, DrawTextW, FillRect, GetSysColor, GetTextExtentPoint32W, HFONT,
-    HGDIOBJ, InvalidateRect, SetBkMode, SetTextColor, TRANSPARENT, UpdateWindow,
+use lwfm_win::controls::{
+    CellBuf, Column, Edit, EditEvent, EditId, ListId, ListSource, ListView, StatusBar,
 };
-use windows::Win32::UI::Controls::*;
-use windows::Win32::UI::HiDpi::SystemParametersInfoForDpi;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
-use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::PCWSTR;
+use lwfm_win::input::{KeyEvent, VirtualKey};
+use lwfm_win::window::{Handler, TimerId, UiWaker, Window, WindowEvent};
+use lwfm_win::{Color, Rect, process};
 
 use crate::cmd::registry::{self, CmdError, CmdResult, Target};
 use crate::config::discover::Env;
@@ -42,28 +37,65 @@ use crate::nav::{History, Location};
 use crate::search::Query;
 use crate::shell;
 use crate::trace;
-use crate::ui::{list, pathbar, scale, searchbox, send, statusbar, wide};
 
-const WM_APP_WAKE: u32 = WM_APP + 1;
-const TIMER_REBUILD: usize = 1;
-/// Highlight behind the matched part of names while searching.
-const MATCH_COLOR: COLORREF = COLORREF(0x0000_E6FF); // RGB(255, 230, 0)
-/// Left margin of Name text inside the label rectangle (at 96 DPI), as the
-/// list control draws it.
-const LABEL_MARGIN: i32 = 2;
+const LIST: ListId = ListId(1);
+const PATH: EditId = EditId(2);
+const STATUS: usize = 3;
+const SEARCH: EditId = EditId(4);
+const TIMER_REBUILD: TimerId = TimerId(1);
 /// While a directory is loading, the list is re-sorted at most this often.
 const REBUILD_INTERVAL: Duration = Duration::from_millis(100);
 
-pub struct Controls {
-    pub main: HWND,
-    pub path: HWND,
-    pub list: HWND,
-    pub status: HWND,
-    /// The find-as-you-type input, hidden while no search is active.
-    pub search: HWND,
+const COLUMNS: [Column; 3] = [
+    Column {
+        title: "Name",
+        width: 360,
+        align_right: false,
+    },
+    Column {
+        title: "Size",
+        width: 90,
+        align_right: true,
+    },
+    Column {
+        title: "Modified",
+        width: 140,
+        align_right: false,
+    },
+];
+
+// Layout measures in pixels at 96 DPI.
+const PADDING: i32 = 4;
+const PATH_HEIGHT: i32 = 26;
+const SEARCH_WIDTH: i32 = 240;
+const SEARCH_HEIGHT: i32 = 24;
+/// Width of the status bar part that shows the item counts.
+const STATUS_COUNTS_WIDTH: i32 = 280;
+
+struct Controls {
+    window: Window,
+    path: Edit,
+    list: ListView,
+    status: StatusBar,
+    /// The find-as-you-type input, hidden while no search is active and
+    /// raised above the list whenever it is shown.
+    search: Edit,
 }
 
-/// What lwfm was started with, besides the window.
+impl Controls {
+    fn create() -> Result<Controls, lwfm_win::Error> {
+        let window = Window::create("lwfm")?;
+        Ok(Controls {
+            path: Edit::new(&window, PATH, true)?,
+            list: ListView::new(&window, LIST, &COLUMNS)?,
+            status: StatusBar::new(&window, STATUS)?,
+            search: Edit::new(&window, SEARCH, false)?,
+            window,
+        })
+    }
+}
+
+/// What lwfm was started with.
 pub struct Startup {
     pub dir: Option<OsString>,
     pub config: Loaded,
@@ -86,30 +118,20 @@ enum Event {
     },
 }
 
-/// Sends events from worker threads and wakes the UI thread at most once per
-/// batch of queued events.
+/// Sends events from worker threads and wakes the UI thread.
 #[derive(Clone)]
 struct Waker {
     tx: Sender<Event>,
-    pending: Arc<AtomicBool>,
-    hwnd: usize,
+    ui: UiWaker,
 }
 
 impl Waker {
+    /// Returns `false` once the receiver is gone.
     fn send(&self, ev: Event) -> bool {
         if self.tx.send(ev).is_err() {
             return false;
         }
-        if !self.pending.swap(true, Ordering::AcqRel) {
-            unsafe {
-                let _ = PostMessageW(
-                    Some(HWND(self.hwnd as *mut _)),
-                    WM_APP_WAKE,
-                    WPARAM(0),
-                    LPARAM(0),
-                );
-            }
-        }
+        self.ui.wake();
         true
     }
 }
@@ -169,8 +191,6 @@ fn join_messages(a: Option<String>, b: Option<String>) -> Option<String> {
 
 pub struct App {
     ui: Controls,
-    dpi: Cell<u32>,
-    font: Cell<HFONT>,
     home: PathBuf,
 
     config: RefCell<Rc<Loaded>>,
@@ -197,42 +217,50 @@ pub struct App {
     message: RefCell<String>,
     last_rebuild: Cell<Option<Instant>>,
     timer_armed: Cell<bool>,
-    last_focus: Cell<HWND>,
 
     generation: Arc<AtomicU64>,
     waker: Waker,
     rx: Receiver<Event>,
 
-    /// Find-as-you-type: the current text (empty when the input is closed)
-    /// and how many visible entries match it.
+    /// Find-as-you-type: whether the input is open, its current text and
+    /// how many visible entries match it.
+    search_open: Cell<bool>,
     search: RefCell<Query>,
     search_matches: Cell<usize>,
-    /// Set while the app itself changes the search input, so its
-    /// notifications do not re-enter.
-    search_guard: Cell<bool>,
 
     startup_traced: Cell<bool>,
     done_at: Cell<Option<Instant>>,
 }
 
+/// Creates the window, runs the message loop and returns the exit code.
+pub fn run(startup: Startup) -> Result<i32, lwfm_win::Error> {
+    let Startup {
+        dir,
+        config,
+        config_file,
+        env,
+        message,
+    } = startup;
+    let app = App::new(Controls::create()?, config, config_file, env);
+    app.layout();
+    app.ui.window.show();
+    app.start(dir, message);
+    Ok(app.ui.window.run(&app))
+}
+
 impl App {
-    pub fn new(ui: Controls, dpi: u32, startup: &mut Startup) -> App {
+    fn new(ui: Controls, config: Loaded, config_file: Option<PathBuf>, env: Env) -> App {
         let (tx, rx) = channel();
         let waker = Waker {
             tx,
-            pending: Arc::new(AtomicBool::new(false)),
-            hwnd: ui.main.0 as usize,
+            ui: ui.window.waker(),
         };
-        let loaded = std::mem::replace(&mut startup.config, config::defaults());
         let app = App {
-            last_focus: Cell::new(ui.list),
             ui,
-            dpi: Cell::new(dpi),
-            font: Cell::new(HFONT::default()),
             home: path::home(),
-            config: RefCell::new(Rc::new(loaded)),
-            config_file: RefCell::new(startup.config_file.clone()),
-            config_env: startup.env.clone(),
+            config: RefCell::new(Rc::new(config)),
+            config_file: RefCell::new(config_file.clone()),
+            config_env: env,
             watcher: RefCell::new(None),
             pending: RefCell::new(Vec::new()),
             hint: RefCell::new(None),
@@ -251,25 +279,22 @@ impl App {
             generation: Arc::new(AtomicU64::new(0)),
             waker,
             rx,
+            search_open: Cell::new(false),
             search: RefCell::new(Query::default()),
             search_matches: Cell::new(0),
-            search_guard: Cell::new(false),
             startup_traced: Cell::new(false),
             done_at: Cell::new(None),
         };
-        app.apply_font();
         app.apply_settings();
-        if let Some(p) = startup.config_file.clone() {
+        if let Some(p) = config_file {
             app.watch_config(p);
         }
         app
     }
 
     /// Opens the start directory: the argument if given, else home.
-    pub fn start(&self, startup: &mut Startup) {
-        unsafe {
-            let _ = SetFocus(Some(self.ui.list));
-        }
+    fn start(&self, dir: Option<OsString>, message: Option<String>) {
+        self.ui.list.focus_control();
         trace::log(|| {
             format!(
                 "window shown after {}",
@@ -277,8 +302,8 @@ impl App {
             )
         });
         let mut nav = Nav::new(NavKind::Start);
-        nav.message = startup.message.take();
-        let target = match startup.dir.take() {
+        nav.message = message;
+        let target = match dir {
             Some(a) => {
                 nav.fallback_home = true;
                 let cwd = std::env::current_dir().unwrap_or_else(|_| self.home.clone());
@@ -289,291 +314,41 @@ impl App {
         self.navigate(target, nav);
     }
 
-    // ---- window messages -------------------------------------------------
-
-    pub fn on_message(&self, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
-        match msg {
-            WM_SIZE => {
-                self.layout();
-                Some(LRESULT(0))
-            }
-            WM_NOTIFY => {
-                let hdr = unsafe { &*(lparam.0 as *const NMHDR) };
-                if hdr.hwndFrom == self.ui.list {
-                    self.on_list_notify(hdr.code, lparam)
-                } else {
-                    None
-                }
-            }
-            WM_COMMAND if lparam.0 == self.ui.search.0 as isize => {
-                match ((wparam.0 >> 16) & 0xFFFF) as u32 {
-                    EN_CHANGE if !self.search_guard.get() => self.on_search_changed(),
-                    EN_KILLFOCUS if !self.search_guard.get() => self.close_search(),
-                    _ => {}
-                }
-                Some(LRESULT(0))
-            }
-            WM_APP_WAKE => {
-                self.drain_events();
-                Some(LRESULT(0))
-            }
-            WM_TIMER if wparam.0 == TIMER_REBUILD => {
-                self.rebuild();
-                Some(LRESULT(0))
-            }
-            WM_ACTIVATE => {
-                if wparam.0 & 0xFFFF == WA_INACTIVE as usize {
-                    let f = unsafe { GetFocus() };
-                    if f == self.ui.list || f == self.ui.path {
-                        self.last_focus.set(f);
-                    }
-                }
-                None
-            }
-            WM_SETFOCUS => {
-                unsafe {
-                    let _ = SetFocus(Some(self.last_focus.get()));
-                }
-                Some(LRESULT(0))
-            }
-            WM_DPICHANGED => {
-                let old = self.dpi.replace((wparam.0 & 0xFFFF) as u32);
-                trace::log(|| format!("dpi changed {old} -> {}", self.dpi.get()));
-                self.apply_font();
-                list::rescale_columns(self.ui.list, old, self.dpi.get());
-                let r = unsafe { &*(lparam.0 as *const RECT) };
-                unsafe {
-                    let _ = SetWindowPos(
-                        self.ui.main,
-                        None,
-                        r.left,
-                        r.top,
-                        r.right - r.left,
-                        r.bottom - r.top,
-                        SWP_NOZORDER | SWP_NOACTIVATE,
-                    );
-                }
-                self.layout();
-                Some(LRESULT(0))
-            }
-            WM_DESTROY => {
-                unsafe { PostQuitMessage(0) };
-                Some(LRESULT(0))
-            }
-            _ => None,
-        }
-    }
-
-    pub fn layout(&self) {
-        let dpi = self.dpi.get();
-        let mut rc = RECT::default();
-        unsafe {
-            let _ = GetClientRect(self.ui.main, &mut rc);
-        }
-        let status_h = statusbar::layout(self.ui.status, dpi);
-        let pad = scale(4, dpi);
-        let path_h = scale(26, dpi);
+    fn layout(&self) {
+        let dpi = self.ui.window.dpi();
+        let client = self.ui.window.client_size();
+        let status_h = self.ui.status.layout(STATUS_COUNTS_WIDTH);
+        let pad = dpi.scale(PADDING);
+        let path_h = dpi.scale(PATH_HEIGHT);
         let list_y = path_h + 2 * pad;
-        let list_h = (rc.bottom - list_y - status_h).max(0);
-        let (search_w, search_h) = (scale(searchbox::WIDTH, dpi), scale(searchbox::HEIGHT, dpi));
-        unsafe {
-            let _ = MoveWindow(self.ui.path, pad, pad, rc.right - 2 * pad, path_h, true);
-            let _ = MoveWindow(self.ui.list, 0, list_y, rc.right, list_h, true);
-            // Over the list's bottom-left corner, above the list in z-order.
-            let _ = SetWindowPos(
-                self.ui.search,
-                Some(HWND_TOP),
-                pad,
-                list_y + list_h - search_h - pad,
-                search_w.min(rc.right - 2 * pad),
-                search_h,
-                SWP_NOACTIVATE,
-            );
-        }
-    }
-
-    fn apply_font(&self) {
-        let mut ncm = NONCLIENTMETRICSW {
-            cbSize: size_of::<NONCLIENTMETRICSW>() as u32,
-            ..Default::default()
-        };
-        let font = unsafe {
-            let ok = SystemParametersInfoForDpi(
-                SPI_GETNONCLIENTMETRICS.0,
-                ncm.cbSize,
-                Some(&mut ncm as *mut _ as *mut _),
-                0,
-                self.dpi.get(),
-            );
-            if ok.is_err() {
-                return;
-            }
-            CreateFontIndirectW(&ncm.lfMessageFont)
-        };
-        for hwnd in [self.ui.path, self.ui.list, self.ui.status, self.ui.search] {
-            send(hwnd, WM_SETFONT, font.0 as usize, 1);
-        }
-        let old = self.font.replace(font);
-        if !old.is_invalid() {
-            unsafe {
-                let _ = DeleteObject(HGDIOBJ(old.0));
-            }
-        }
-    }
-
-    fn on_list_notify(&self, code: u32, lparam: LPARAM) -> Option<LRESULT> {
-        match code {
-            LVN_GETDISPINFOW => {
-                let info = unsafe { &mut *(lparam.0 as *mut NMLVDISPINFOW) };
-                if info.item.mask.0 & LVIF_TEXT.0 != 0
-                    && let Ok(model) = self.model.try_borrow()
-                    && let Some(e) = model.entry(info.item.iItem as usize)
-                {
-                    let text = cell_text(e, info.item.iSubItem);
-                    list::write_text(&mut info.item, &text);
-                }
-                Some(LRESULT(0))
-            }
-            NM_CUSTOMDRAW => {
-                let cd = unsafe { &mut *(lparam.0 as *mut NMLVCUSTOMDRAW) };
-                let searching = !self.search.borrow().is_empty();
-                let subitem = NMCUSTOMDRAW_DRAW_STAGE(CDDS_ITEMPREPAINT.0 | CDDS_SUBITEM.0);
-                let r = match cd.nmcd.dwDrawStage {
-                    CDDS_PREPAINT => CDRF_NOTIFYITEMDRAW,
-                    CDDS_ITEMPREPAINT => {
-                        self.set_row_color(cd);
-                        // While searching, Name cells with a match are drawn by hand.
-                        CDRF_NEWFONT | if searching { CDRF_NOTIFYSUBITEMDRAW } else { 0 }
-                    }
-                    stage if stage == subitem => {
-                        self.set_row_color(cd);
-                        if cd.iSubItem == 0 && searching && self.paint_match(cd) {
-                            CDRF_SKIPDEFAULT
-                        } else {
-                            CDRF_NEWFONT
-                        }
-                    }
-                    _ => CDRF_DODEFAULT,
-                };
-                Some(LRESULT(r as isize))
-            }
-            LVN_COLUMNCLICK => {
-                let nm = unsafe { &*(lparam.0 as *const NMLISTVIEW) };
-                if let Some(key) = SortKey::from_column(nm.iSubItem) {
-                    let cur = self.model.borrow().sort;
-                    let reverse = cur.key == key && !cur.reverse;
-                    let cmd = format!(
-                        "sort {}{}",
-                        key.name(),
-                        if reverse { " --reverse" } else { "" }
-                    );
-                    self.run_str(&cmd);
-                }
-                Some(LRESULT(0))
-            }
-            NM_DBLCLK => {
-                let nm = unsafe { &*(lparam.0 as *const NMITEMACTIVATE) };
-                if nm.iItem >= 0 {
-                    self.run_str("open");
-                }
-                Some(LRESULT(0))
-            }
-            LVN_ITEMCHANGED | LVN_ODSTATECHANGED => {
-                self.update_status();
-                Some(LRESULT(0))
-            }
-            _ => None,
-        }
-    }
-
-    /// Directory and hidden-item text colors from the config.
-    fn set_row_color(&self, cd: &mut NMLVCUSTOMDRAW) {
-        let colors = self.config.borrow().settings.colors;
-        if let Ok(model) = self.model.try_borrow()
-            && let Some(e) = model.entry(cd.nmcd.dwItemSpec)
-        {
-            if e.is_hidden() {
-                cd.clrText = COLORREF(colors.hidden);
-            } else if e.is_dir() {
-                cd.clrText = COLORREF(colors.dir);
-            }
-        }
-    }
-
-    /// Draws the Name cell of a row whose name matches the search, with the
-    /// match on a highlight background. Returns `false` (default drawing)
-    /// when the name does not match.
-    fn paint_match(&self, cd: &NMLVCUSTOMDRAW) -> bool {
-        let row = cd.nmcd.dwItemSpec;
-        let Some((mut text, range)) = self.model.try_borrow().ok().and_then(|m| {
-            let e = m.entry(row)?;
-            let range = self.search.borrow().find(&e.name)?;
-            Some((cell_text(e, 0), range))
-        }) else {
-            return false;
-        };
-        let hdc = cd.nmcd.hdc;
-        let rc = list::label_rect(self.ui.list, row);
-        let color = if cd.clrText.0 & 0xFF00_0000 != 0 {
-            COLORREF(unsafe { GetSysColor(COLOR_WINDOWTEXT) })
-        } else {
-            cd.clrText
-        };
-        let width = |s: &[u16]| {
-            let mut size = SIZE::default();
-            unsafe {
-                let _ = GetTextExtentPoint32W(hdc, s, &mut size);
-            }
-            size
-        };
-        let flags = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX;
-        let mut x = rc.left + scale(LABEL_MARGIN, self.dpi.get());
-        let draw = |segment: &mut [u16], x: i32| {
-            let mut r = RECT { left: x, ..rc };
-            unsafe { DrawTextW(hdc, segment, &mut r, flags) };
-        };
-        unsafe {
-            SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, color);
-        }
-        let (head, rest) = text.split_at_mut(range.start);
-        let (hit, tail) = rest.split_at_mut(range.end - range.start);
-        draw(head, x);
-        x += width(head).cx;
-        let size = width(hit);
-        let top = rc.top + (rc.bottom - rc.top - size.cy) / 2;
-        let mark = RECT {
-            left: x,
-            top,
-            right: (x + size.cx).min(rc.right),
-            bottom: top + size.cy,
-        };
-        unsafe {
-            let brush = CreateSolidBrush(MATCH_COLOR);
-            FillRect(hdc, &mark, brush);
-            let _ = DeleteObject(HGDIOBJ(brush.0));
-        }
-        draw(hit, x);
-        x += size.cx;
-        draw(tail, x);
-        true
+        let list_h = (client.height - list_y - status_h).max(0);
+        let (search_w, search_h) = (dpi.scale(SEARCH_WIDTH), dpi.scale(SEARCH_HEIGHT));
+        self.ui
+            .path
+            .set_bounds(Rect::new(pad, pad, client.width - 2 * pad, path_h));
+        self.ui
+            .list
+            .set_bounds(Rect::new(0, list_y, client.width, list_h));
+        // Over the list's bottom-left corner.
+        self.ui.search.set_bounds(Rect::new(
+            pad,
+            list_y + list_h - search_h - pad,
+            search_w.min(client.width - 2 * pad),
+            search_h,
+        ));
     }
 
     // ---- keyboard --------------------------------------------------------
 
-    /// Resolves keyboard messages against the keymap before any control sees
-    /// them. Returns `true` when the message was consumed.
-    pub fn translate_key(&self, msg: &MSG) -> bool {
-        let chord = match msg.message {
-            WM_KEYDOWN | WM_SYSKEYDOWN => normalize::from_keydown(
-                msg.wParam.0 as u16,
-                normalize::ModState::current(),
-                &normalize::layout_char,
+    /// Resolves keyboard events against the keymap before any control sees
+    /// them. Returns `true` when the event was consumed.
+    fn translate_key(&self, event: KeyEvent) -> bool {
+        let (chord, typed) = match event {
+            KeyEvent::Down { key, mods } => (
+                normalize::from_keydown(key, mods, &VirtualKey::layout_char),
+                false,
             ),
-            // WM_SYSCHAR (alt+key) is deliberately ignored: its chord was
-            // already looked up on key-down with the alt modifier.
-            WM_CHAR => normalize::from_char(msg.wParam.0 as u16),
-            _ => None,
+            KeyEvent::Char(c) => (normalize::from_char(c), true),
         };
         let Some(chord) = chord else { return false };
         let chain = self.scope_chain();
@@ -610,7 +385,7 @@ impl App {
             }
             Lookup::None => {
                 // Typing in the list opens the search input.
-                if msg.message == WM_CHAR
+                if typed
                     && chain.contains(&Scope::List)
                     && let Key::Char(c) = chord.key
                 {
@@ -626,12 +401,11 @@ impl App {
     }
 
     fn scope_chain(&self) -> Vec<Scope> {
-        let f = unsafe { GetFocus() };
-        if f == self.ui.path {
+        if self.ui.path.has_focus() {
             vec![Scope::Input, Scope::Global]
-        } else if f == self.ui.search {
+        } else if self.ui.search.has_focus() {
             vec![Scope::Search, Scope::Global]
-        } else if f == self.ui.list {
+        } else if self.ui.list.has_focus() {
             vec![Scope::List, Scope::Global]
         } else {
             vec![Scope::Global]
@@ -694,11 +468,13 @@ impl App {
     }
 
     fn focused_path(&self) -> Option<PathBuf> {
-        self.entry_path(list::focused(self.ui.list)?)
+        self.entry_path(self.ui.list.focused()?)
     }
 
     fn selected_paths(&self) -> Vec<PathBuf> {
-        list::selected(self.ui.list)
+        self.ui
+            .list
+            .selected()
             .into_iter()
             .filter_map(|i| self.entry_path(i))
             .collect()
@@ -740,7 +516,6 @@ impl App {
     }
 
     fn drain_events(&self) {
-        self.waker.pending.store(false, Ordering::Release);
         while let Ok(ev) = self.rx.try_recv() {
             match ev {
                 Event::Fs(m) => self.on_fs(m),
@@ -852,17 +627,12 @@ impl App {
         self.last_rebuild.set(None);
 
         let display = path.display().to_string();
-        let title = wide(format!("{display} - lwfm"));
-        unsafe {
-            let _ = SetWindowTextW(self.ui.main, PCWSTR(title.as_ptr()));
-        }
-        pathbar::set_text(self.ui.path, &display);
+        self.ui.window.set_title(&format!("{display} - lwfm"));
+        self.ui.path.set_text(&display);
         *self.cwd.borrow_mut() = Some(path);
         *self.message.borrow_mut() = nav.message.unwrap_or_default();
         if nav.focus_list {
-            unsafe {
-                let _ = SetFocus(Some(self.ui.list));
-            }
+            self.ui.list.focus_control();
         }
     }
 
@@ -874,14 +644,7 @@ impl App {
         if due {
             self.rebuild();
         } else if !self.timer_armed.replace(true) {
-            unsafe {
-                SetTimer(
-                    Some(self.ui.main),
-                    TIMER_REBUILD,
-                    REBUILD_INTERVAL.as_millis() as u32,
-                    None,
-                )
-            };
+            self.ui.window.start_timer(TIMER_REBUILD, REBUILD_INTERVAL);
         }
     }
 
@@ -889,9 +652,7 @@ impl App {
     /// selection on the same entries (or applying a pending restore target).
     fn rebuild(&self) {
         if self.timer_armed.replace(false) {
-            unsafe {
-                let _ = KillTimer(Some(self.ui.main), TIMER_REBUILD);
-            }
+            self.ui.window.stop_timer(TIMER_REBUILD);
         }
         let pending_restore = self.restore.borrow().is_some();
         let keep = (!pending_restore).then(|| self.save_selection());
@@ -901,7 +662,7 @@ impl App {
             m.rebuild();
             m.visible.len()
         };
-        list::set_count(self.ui.list, count);
+        self.ui.list.set_count(count);
 
         let found = match keep {
             Some(sel) => self.apply_selection(&sel),
@@ -917,14 +678,11 @@ impl App {
         };
         if !found && count > 0 {
             // Always show a cursor; it lands on the first entry.
-            list::select(self.ui.list, 0);
-            list::focus(self.ui.list, 0);
+            self.ui.list.select(0);
+            self.ui.list.focus(0);
         }
 
-        unsafe {
-            let _ = InvalidateRect(Some(self.ui.list), None, false);
-            let _ = UpdateWindow(self.ui.list);
-        }
+        self.ui.list.redraw_now();
         self.last_rebuild.set(Some(Instant::now()));
         if !self.search.borrow().is_empty() {
             self.count_matches();
@@ -956,13 +714,13 @@ impl App {
     }
 
     fn focused_name(&self) -> Option<Box<[u16]>> {
-        let i = list::focused(self.ui.list)?;
+        let i = self.ui.list.focused()?;
         self.model.borrow().entry(i).map(|e| e.name.clone())
     }
 
     fn save_selection(&self) -> Selection {
-        let selected = list::selected(self.ui.list);
-        let focused = list::focused(self.ui.list);
+        let selected = self.ui.list.selected();
+        let focused = self.ui.list.focused();
         let model = self.model.borrow();
         Selection {
             focused: focused.and_then(|i| model.entry(i)).map(|e| e.name.clone()),
@@ -983,12 +741,12 @@ impl App {
                 sel.focused.as_deref().and_then(|n| model.find(n)),
             )
         };
-        list::clear_selection(self.ui.list);
+        self.ui.list.clear_selection();
         for i in indices {
-            list::select(self.ui.list, i);
+            self.ui.list.select(i);
         }
         if let Some(i) = focus {
-            list::focus(self.ui.list, i);
+            self.ui.list.focus(i);
         }
         focus.is_some()
     }
@@ -1002,7 +760,7 @@ impl App {
 
     /// The search input's text changed: select the first match.
     fn on_search_changed(&self) {
-        let text = pathbar::text(self.ui.search);
+        let text = self.ui.search.text();
         if text.is_empty() {
             self.close_search();
             return;
@@ -1014,12 +772,10 @@ impl App {
             .borrow()
             .next_match(&self.search.borrow(), None, true);
         if let Some(i) = first {
-            list::select_only(self.ui.list, i);
+            self.ui.list.select_only(i);
         }
         self.count_matches();
-        unsafe {
-            let _ = InvalidateRect(Some(self.ui.list), None, false);
-        }
+        self.ui.list.set_highlighting(true);
         self.update_status();
         trace::log(|| {
             format!(
@@ -1034,34 +790,31 @@ impl App {
         if self.search.borrow().is_empty() {
             return;
         }
-        let from = list::focused(self.ui.list);
+        let from = self.ui.list.focused();
         let next = self
             .model
             .borrow()
             .next_match(&self.search.borrow(), from, forward);
         if let Some(i) = next {
-            list::select_only(self.ui.list, i);
+            self.ui.list.select_only(i);
+            self.update_status();
         }
     }
 
     /// Hides the search input and its highlights; the selection stays.
     fn close_search(&self) {
-        if self.search.borrow().is_empty() && !searchbox::is_visible(self.ui.search) {
+        // Moving the focus away below reports the input's focus loss, which
+        // lands here again; the flag makes that second call return at once.
+        if !self.search_open.replace(false) {
             return;
         }
-        self.search_guard.set(true);
         *self.search.borrow_mut() = Query::default();
-        if unsafe { GetFocus() } == self.ui.search {
-            unsafe {
-                let _ = SetFocus(Some(self.ui.list));
-            }
+        if self.ui.search.has_focus() {
+            self.ui.list.focus_control();
         }
-        pathbar::set_text(self.ui.search, "");
-        searchbox::hide(self.ui.search);
-        self.search_guard.set(false);
-        unsafe {
-            let _ = InvalidateRect(Some(self.ui.list), None, false);
-        }
+        self.ui.search.set_text("");
+        self.ui.search.hide();
+        self.ui.list.set_highlighting(false);
         self.update_status();
     }
 
@@ -1082,7 +835,7 @@ impl App {
                 .map(|m| m.visible.len())
                 .unwrap_or(0);
             let query = self.search.borrow().text().to_string();
-            let selected = list::selected_count(self.ui.list);
+            let selected = self.ui.list.selected_count();
             match (query.is_empty(), self.search_matches.get(), selected) {
                 (false, 0, _) => format!("Search: {query}  no matches"),
                 (false, 1, _) => format!("Search: {query}  1 match"),
@@ -1091,12 +844,12 @@ impl App {
                 (true, _, s) => format!("{n} items, {s} selected"),
             }
         };
-        statusbar::set_part(self.ui.status, 0, &counts);
+        self.ui.status.set_part(0, &counts);
         let msg = match self.hint.borrow().as_ref() {
             Some(h) => h.clone(),
             None => self.message.borrow().clone(),
         };
-        statusbar::set_part(self.ui.status, 1, &msg);
+        self.ui.status.set_part(1, &msg);
     }
 
     // ---- configuration ---------------------------------------------------
@@ -1191,7 +944,7 @@ impl App {
 
     fn shell_open(&self, file: PathBuf, dir: PathBuf) {
         let waker = self.waker.clone();
-        let owner = WindowToken::from_raw(self.ui.main.0 as isize);
+        let owner = self.ui.window.token();
         std::thread::spawn(move || {
             if let Err(e) = process::shell_open(owner, &file, &dir) {
                 let msg = format!("Cannot open {}: {e}", file.display());
@@ -1201,29 +954,115 @@ impl App {
     }
 }
 
-/// Text of one list cell.
-fn cell_text(e: &Entry, column: i32) -> Vec<u16> {
+/// Writes the text of one list cell.
+fn write_cell(e: &Entry, column: usize, out: &mut CellBuf<'_>) {
     match column {
         0 => {
-            let mut v = e.name.to_vec();
+            out.push_units(&e.name);
             if e.is_dir() {
-                v.push(b'\\' as u16);
+                out.push_unit(u16::from(b'\\'));
             }
-            v
         }
-        1 if e.is_dir() => Vec::new(),
-        1 => entry::format_size(e.size).encode_utf16().collect(),
-        2 => lwfm_win::text::to_local(e.mtime)
-            .map(|t| entry::format_time(&t))
-            .unwrap_or_default()
-            .encode_utf16()
-            .collect(),
-        _ => Vec::new(),
+        1 if !e.is_dir() => out.push_str(&entry::format_size(e.size)),
+        2 => {
+            if let Some(t) = lwfm_win::text::to_local(e.mtime) {
+                out.push_str(&entry::format_time(&t));
+            }
+        }
+        _ => {}
     }
 }
 
 fn os_name(name: &[u16]) -> OsString {
     OsString::from_wide(name)
+}
+
+impl Handler for App {
+    fn on_event(&self, event: WindowEvent) {
+        match event {
+            WindowEvent::Resized | WindowEvent::SettingsChanged => self.layout(),
+            WindowEvent::DpiChanged { old, new } => {
+                trace::log(|| format!("dpi changed {} -> {}", old.0, new.0));
+                self.layout();
+            }
+            WindowEvent::Timer(TIMER_REBUILD) => self.rebuild(),
+            WindowEvent::Wake => self.drain_events(),
+            WindowEvent::Timer(_) | WindowEvent::Destroyed => {}
+        }
+    }
+
+    fn on_key(&self, key: KeyEvent) -> bool {
+        self.translate_key(key)
+    }
+
+    fn list_source(&self, _id: ListId) -> &dyn ListSource {
+        self
+    }
+
+    fn on_edit(&self, id: EditId, event: EditEvent) {
+        if id != SEARCH {
+            return;
+        }
+        match event {
+            EditEvent::Changed => self.on_search_changed(),
+            EditEvent::LostFocus => self.close_search(),
+        }
+    }
+}
+
+/// The list reads the model while it paints, which can happen inside any
+/// call into the list; hence `try_borrow`: a cell that cannot be read is
+/// left empty instead of panicking in the window procedure.
+impl ListSource for App {
+    fn cell(&self, row: usize, column: usize, out: &mut CellBuf<'_>) {
+        if let Ok(model) = self.model.try_borrow()
+            && let Some(e) = model.entry(row)
+        {
+            write_cell(e, column, out);
+        }
+    }
+
+    /// Directory and hidden-item text colors from the config.
+    fn row_color(&self, row: usize) -> Option<Color> {
+        let colors = self.config.try_borrow().ok()?.settings.colors;
+        let model = self.model.try_borrow().ok()?;
+        let e = model.entry(row)?;
+        if e.is_hidden() {
+            Some(colors.hidden)
+        } else if e.is_dir() {
+            Some(colors.dir)
+        } else {
+            None
+        }
+    }
+
+    fn highlight(&self, row: usize) -> Option<Range<usize>> {
+        let model = self.model.try_borrow().ok()?;
+        let query = self.search.try_borrow().ok()?;
+        query.find(&model.entry(row)?.name)
+    }
+
+    fn on_activate(&self, _row: usize) {
+        self.run_str("open");
+    }
+
+    fn on_column_click(&self, column: usize) {
+        let Some(key) = SortKey::from_column(column) else {
+            return;
+        };
+        let cur = self.model.borrow().sort;
+        let reverse = cur.key == key && !cur.reverse;
+        let cmd = format!(
+            "sort {}{}",
+            key.name(),
+            if reverse { " --reverse" } else { "" }
+        );
+        self.run_str(&cmd);
+    }
+
+    fn on_selection_changed(&self) {
+        self.update_status();
+    }
 }
 
 impl Host for App {
@@ -1246,9 +1085,7 @@ impl Target for App {
             return Ok(());
         };
         let mut nav = Nav::new(NavKind::New);
-        nav.select = cwd
-            .file_name()
-            .map(|n| wide(n)[..].split_last().unwrap().1.into());
+        nav.select = cwd.file_name().map(|n| n.encode_wide().collect());
         self.navigate(parent, nav);
         Ok(())
     }
@@ -1277,7 +1114,7 @@ impl Target for App {
         let Some(cwd) = self.cwd.borrow().clone() else {
             return Ok(());
         };
-        let Some(i) = list::focused(self.ui.list) else {
+        let Some(i) = self.ui.list.focused() else {
             return Ok(());
         };
         let Some((name, is_dir)) = self
@@ -1326,29 +1163,25 @@ impl Target for App {
     }
 
     fn focus_path(&self) -> CmdResult {
-        unsafe {
-            let _ = SetFocus(Some(self.ui.path));
-        }
-        pathbar::select_all(self.ui.path);
+        self.ui.path.focus_control();
+        self.ui.path.select_all();
         Ok(())
     }
 
     fn focus_list(&self) -> CmdResult {
-        unsafe {
-            let _ = SetFocus(Some(self.ui.list));
-        }
+        self.ui.list.focus_control();
         Ok(())
     }
 
     fn path_submit(&self) -> CmdResult {
-        let text = pathbar::text(self.ui.path);
+        let text = self.ui.path.text();
         if let Some(command) = text.trim_start().strip_prefix(':') {
             if command.trim().is_empty() {
                 return self.path_cancel();
             }
             registry::run_str(self, command)?;
             // Success: show the directory again (unless the command moved focus there).
-            if unsafe { GetFocus() } == self.ui.path {
+            if self.ui.path.has_focus() {
                 self.path_cancel()?;
             }
             return Ok(());
@@ -1367,14 +1200,12 @@ impl Target for App {
             .as_deref()
             .map(Path::display)
             .map(|d| d.to_string());
-        pathbar::set_text(self.ui.path, &cwd.unwrap_or_default());
+        self.ui.path.set_text(&cwd.unwrap_or_default());
         self.focus_list()
     }
 
     fn quit(&self) -> CmdResult {
-        unsafe {
-            let _ = DestroyWindow(self.ui.main);
-        }
+        self.ui.window.close();
         Ok(())
     }
 
@@ -1404,17 +1235,14 @@ impl Target for App {
     }
 
     fn search(&self, text: &str) -> CmdResult {
-        searchbox::show(self.ui.search);
-        unsafe {
-            let _ = SetFocus(Some(self.ui.search));
-        }
-        // Setting the text runs the jump through EN_CHANGE.
-        pathbar::set_text(self.ui.search, text);
-        let end = text.encode_utf16().count();
-        send(self.ui.search, EM_SETSEL, end, end as isize);
-        if text.is_empty() {
-            self.close_search();
-        }
+        self.search_open.set(true);
+        self.ui.search.show_on_top();
+        self.ui.search.focus_control();
+        self.ui.search.set_text(text);
+        self.ui.search.set_caret(text.encode_utf16().count());
+        // Setting the text is not reported back, so run the jump here. Empty
+        // text closes the input again.
+        self.on_search_changed();
         Ok(())
     }
 
@@ -1434,11 +1262,9 @@ impl Target for App {
     }
 
     fn prompt(&self) -> CmdResult {
-        unsafe {
-            let _ = SetFocus(Some(self.ui.path));
-        }
-        pathbar::set_text(self.ui.path, ":");
-        send(self.ui.path, EM_SETSEL, 1, 1);
+        self.ui.path.focus_control();
+        self.ui.path.set_text(":");
+        self.ui.path.set_caret(1);
         Ok(())
     }
 

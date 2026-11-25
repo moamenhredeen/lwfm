@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 
+use lwfm_win::Color;
 use mlua::{Table, Value};
 
 use super::Settings;
@@ -75,14 +76,6 @@ fn boolean(v: &Value, path: &str) -> Result<bool, String> {
             other.type_name()
         )),
     }
-}
-
-/// `"#rrggbb"` -> COLORREF (0x00BBGGRR).
-pub fn parse_color(s: &str) -> Option<u32> {
-    let hex = s.strip_prefix('#').filter(|h| h.len() == 6)?;
-    let rgb = u32::from_str_radix(hex, 16).ok()?;
-    let (r, g, b) = (rgb >> 16, (rgb >> 8) & 0xFF, rgb & 0xFF);
-    Some(r | (g << 8) | (b << 16))
 }
 
 /// A key or opener value: command string, list of commands, Lua function,
@@ -226,7 +219,7 @@ pub fn read(cfg: &Table, preset: &Table) -> Result<Read, String> {
                         }
                     };
                     let s = string(&cv, &path)?;
-                    *target = parse_color(&s).ok_or_else(|| {
+                    *target = Color::from_hex(&s).ok_or_else(|| {
                         format!("{path}: expected a color as \"#rrggbb\", got `{s}`")
                     })?;
                 }
@@ -273,17 +266,4 @@ pub fn read(cfg: &Table, preset: &Table) -> Result<Read, String> {
         openers,
         warnings,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn colors() {
-        assert_eq!(parse_color("#1a5fb4"), Some(0x00B4_5F1A));
-        assert_eq!(parse_color("#FF0000"), Some(0x0000_00FF));
-        assert_eq!(parse_color("blue"), None);
-        assert_eq!(parse_color("#12345"), None);
-    }
 }

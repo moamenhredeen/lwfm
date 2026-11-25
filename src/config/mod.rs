@@ -7,6 +7,7 @@ pub mod watch;
 
 use std::path::Path;
 
+use lwfm_win::Color;
 use mlua::{Lua, Value};
 
 use crate::cmd::registry::{self, Invocation};
@@ -18,9 +19,8 @@ pub const STARTER: &str = include_str!("starter.lua");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Colors {
-    /// COLORREF values (0x00BBGGRR).
-    pub dir: u32,
-    pub hidden: u32,
+    pub dir: Color,
+    pub hidden: Color,
 }
 
 pub struct Settings {
@@ -37,8 +37,8 @@ impl Default for Settings {
             show_hidden: false,
             sort: Sort::default(),
             colors: Colors {
-                dir: 0x00B4_5F1A,
-                hidden: 0x0080_8080,
+                dir: Color::rgb(0x1a, 0x5f, 0xb4),
+                hidden: Color::rgb(0x80, 0x80, 0x80),
             },
             editor: registry::compile(r#"shell "notepad $f""#).expect("valid default editor"),
         }
@@ -212,8 +212,8 @@ mod tests {
                 reverse: true
             }
         );
-        assert_eq!(l.settings.colors.dir, 0x0000_00FF);
-        assert_eq!(l.settings.colors.hidden, 0x0080_8080);
+        assert_eq!(l.settings.colors.dir, Color::rgb(0xff, 0, 0));
+        assert_eq!(l.settings.colors.hidden, Color::rgb(0x80, 0x80, 0x80));
         // Without the preset table the explorer keys still form the base layer.
         assert_eq!(name_of(&l, Scope::List, "enter").as_deref(), Some("open"));
     }

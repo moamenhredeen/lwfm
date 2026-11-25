@@ -37,7 +37,7 @@ Alternative: move the binary to `crates/lwfm`. Rejected: it renames every file f
 
 1. `lwfm` has no `windows` dependency. A `windows` type cannot appear in application code because it cannot be named.
 2. `lwfm` declares `#![forbid(unsafe_code)]`.
-3. `lwfm-win` re-exports nothing from `windows` and uses its own small types in signatures: `Rect`, `Size`, `Color` (0xRRGGBB), `Dpi`, `ListId`, `EditId`, `TimerId`, `LocalTime`, `Error`.
+3. `lwfm-win` re-exports nothing from `windows` and uses its own small types in signatures: `Rect`, `Size`, `Color`, `Dpi`, `ListId`, `EditId`, `TimerId`, `LocalTime`, `Error`. One deliberate exception: `impl From<windows::core::Error> for Error`, so that `?` works inside the crate. It is a public trait impl, but the application cannot name its source type without depending on `windows`.
 4. `lwfm-win` enables `clippy::undocumented_unsafe_blocks` and `clippy::multiple_unsafe_ops_per_block` as errors.
 
 Alternative: a `win` module inside the single crate. Rejected: nothing would stop a later change from importing `windows` elsewhere.
@@ -70,7 +70,7 @@ let app = App::new(window, controls, startup);
 app.window().run(&app)          // returns the exit code
 ```
 
-`run` stores a pointer to the handler in the window's user data for the duration of the loop and clears it before returning; the handler is borrowed for exactly that time, so no `Rc` and no thread-local is needed. Messages that arrive while no handler is attached get default handling.
+The window's user data holds a reference-counted `WindowState` (font, DPI, registered controls), attached in `Window::create` and released on `WM_NCDESTROY`. `run` stores a pointer to the handler in that state for the duration of the loop and clears it before returning; the handler is borrowed for exactly that time, so the application needs no `Rc` and no thread-local. While no handler is attached the mechanical handling still runs and events are dropped.
 
 ```rust
 pub trait Handler {
@@ -120,9 +120,11 @@ pub trait ListSource {
 
 Notification callbacks (`on_edit`, `on_selection_changed`, `on_activate`, `on_column_click`) report user-caused changes only. While a mutating crate method runs, a per-window quiet counter (RAII guard) suppresses them. Data callbacks (`cell`, `row_color`, `highlight`) are never suppressed and may be called synchronously inside any crate method.
 
+One exception, found while switching the application: `EditEvent::LostFocus` is reported whatever moved the focus, including `focus_control()` of another control, because the application relies on it (running `focus-path` while the search input is open must close the search, as before). Only `Edit::hide()` suppresses it. The application tracks whether the search is open in its own state, so the focus loss it causes itself while closing is ignored without a guard flag around the control calls.
+
 Consequences in the application:
 
-- `search_guard` is removed. `App::search` calls its own "search text changed" function after `set_text` instead of relying on `EN_CHANGE`.
+- `search_guard` is replaced by `search_open`, which is state (is the search active) and not a re-entrancy guard. `App::search` calls its own "search text changed" function after `set_text` instead of relying on `EN_CHANGE`.
 - `rebuild`, `on_search_changed` and `close_search` already refresh the status bar themselves. `step_match` does not and must do so after `select_only`.
 - Restoring a large selection no longer refreshes the status bar once per item.
 
@@ -147,7 +149,7 @@ Alternative: export virtual-key numbers as `u16` constants. Rejected: it leaks t
 ### D9. Leaf functions
 
 - `fs::list_dir(path, &mut dyn FnMut(RawEntry<'_>) -> ControlFlow<()>) -> Result<(), Error>`: bulk enumeration with fallback to find, long-path encoding inside. `RawEntry` borrows the name and exposes `size`, `mtime`, `is_dir`, `is_hidden`. The application's `Entry` stores two booleans instead of the raw attribute bits. Batching, generation checks and `FsMsg` stay in `src/fs/enumerate.rs`.
-- `fs::DirWatcher::start(dir, on_change: impl FnMut(&[PathBuf]) + Send) -> Result<DirWatcher, Error>`: the crate owns the watcher thread and the directory handle. `Drop` cancels the pending read with `CancelIoEx`, so the thread ends promptly. Debounce, relevance filter, re-read and duplicate suppression stay in `src/config/watch.rs`, running inside the callback on the watcher thread as today.
+- `fs::DirWatcher::start(dir, on_change: impl FnMut(&[PathBuf]) + Send) -> Result<DirWatcher, Error>`: the crate owns the watcher thread and the directory handle. The read is overlapped and the thread waits on it together with a stop event that `Drop` signals; the thread then cancels its own read with `CancelIoEx` and waits for the cancellation before it frees the buffer, so it ends promptly and without a race between `Drop` and the start of a read. Debounce, relevance filter, re-read and duplicate suppression stay in `src/config/watch.rs`, running inside the callback on the watcher thread as today.
 - `process::spawn_cmd(line, dir, console) -> Result<Child, Error>` and `Child::wait() -> Result<u32, Error>`; `process::shell_open(owner: WindowToken, file, dir) -> Result<(), Error>` initialises COM with a guard that uninitialises only after a successful initialisation, and treats user cancellation as success. All take `&Path`/`&OsStr` and encode without loss.
 - `text::compare_natural(&[u16], &[u16]) -> Ordering`, `text::to_local(i64) -> Option<LocalTime>`.
 - `sys::attach_parent_console()`, `sys::debug_output(&str)`, `sys::since_process_start()`.
@@ -223,7 +225,6 @@ One change, eight task groups, each leaving the tree green (`cargo clippy --all-
 - [Very large diff in one change] → eight separately committed, green task groups; groups 1 to 5 move code with minimal edits, restructuring of `App` starts only in group 6.
 - [`try_borrow` fallback keeps hiding borrow conflicts in release builds] → `debug_assert!` in the same place, and all manual verification is done with a debug build first.
 - [`WM_SETTINGCHANGE` is broadcast often and for unrelated settings] → the font is recreated only when the reported metrics differ from the current ones.
-- [`CancelIoEx` cancels only I/O on that handle, and the read may not have started yet] → the stop flag is checked after every return of the read, and the handle is closed by the thread, not by `Drop`.
 
 ## Migration Plan
 
