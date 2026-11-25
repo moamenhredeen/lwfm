@@ -8,7 +8,8 @@ context: |
 
   Tech stack:
   - Rust (edition 2024, nightly toolchain), Windows-only binary.
-  - Raw Win32 via Microsoft's `windows` crate (minimal feature flags).
+  - Raw Win32 via Microsoft's `windows` crate (minimal feature flags), used
+    only inside the workspace crate `crates/lwfm-win`.
     No UI frameworks (no WinUI, egui, native-windows-gui, winsafe).
   - Common controls v6: virtual ListView (LVS_OWNERDATA), Edit, status bar.
   - Manifest embedded with `embed-manifest` (PerMonitorV2 DPI, longPathAware).
@@ -16,8 +17,21 @@ context: |
     language (config.lua, WezTerm style), coming in `config-and-scripting`.
 
   Architecture rules:
+  - `lwfm-win` is the only crate that depends on `windows` or contains
+    `unsafe`; the `lwfm` binary declares `#![forbid(unsafe_code)]`. The public
+    API of `lwfm-win` exposes no `windows` types and no escape hatch (no raw
+    handles, no generic send-message): a missing capability is added to the
+    crate, shaped by what lwfm needs it for. Every `unsafe` block does one
+    thing and carries a `// SAFETY:` comment (enforced by clippy).
+  - Controls are used through use-case traits (`ListSource` for the list):
+    the application answers questions about its data, the crate owns the
+    notification and paint protocol. Window-level facts arrive as plain
+    `WindowEvent`s through `Handler`.
+  - Changes made through a control's own methods are not echoed back as
+    notifications; only what the user did is reported (exception: an input
+    losing the focus is always reported).
   - The UI thread never does disk or network IO; workers report back through
-    a channel plus a WM_APP wake message, tagged with a generation counter so
+    a channel plus a `UiWaker` wake-up, tagged with a generation counter so
     stale results are dropped.
   - Every user action is a command in the registry (src/cmd/registry.rs).
     Keys, mouse, path bar, and later Lua and IPC only compile and run command
@@ -25,8 +39,10 @@ context: |
   - Keys are intercepted in the message loop and normalized to chords
     (AltGr-safe, logical keys, canonical text form like `ctrl+shift+f5`);
     lookup walks scopes input/list -> global.
-  - App state lives on the UI thread in Cell/RefCell; never hold a borrow
-    across calls that can re-enter the window procedure (SendMessageW etc.).
+  - App state lives on the UI thread in a few RefCell groups (src/app/),
+    reached through closure-taking accessors; never hold a borrow across a
+    call into the window or a control, because they call back into the
+    application (the list asks for cell text while its row count is set).
   - Names stay UTF-16 from the file system to the display; paths are absolute
     and normalized, with \\?\ added only at file API calls.
 

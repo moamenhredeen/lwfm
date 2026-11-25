@@ -233,17 +233,23 @@ No data or configuration migration. Rollback is a revert of the task-group commi
 
 ## Open Questions
 
-- Final clippy allow list (D13): decided while fixing the warnings; does not affect structure.
-- Whether `windows::core::Owned` covers GDI handles in 0.62 or a private guard is needed (D10): either satisfies the design.
+Both were settled during implementation:
+
+- Clippy allow list (D13): only `module_name_repetitions` is allowed for the workspace; three item-level `#[allow]`s carry their reason.
+- Resource guards (D10): private guard types are used throughout (`OwnedHandle`, `FindHandle`, `ComApartment`, `Font`, `Brush`); `windows::core::Owned` is not used.
 
 ## Measurements
 
-Release build, `LWFM_TRACE=1`, starter config, local SSD, median of 5 runs (single runs vary by about 20 %; the first run after a build is an outlier and is included).
+Release build, `LWFM_TRACE=1`, starter config, local SSD. Single runs vary by about 20 %, so the before and after builds were measured in the same session, interleaved, twice, with the median of 9 runs each. The first table row group is the baseline taken before any change (median of 5 runs, including the cold first run).
 
-| Measure | Budget | Baseline (before, `d0a25f1`) |
-|---|---|---|
-| Config load (starter config) | < 10 ms | 0.8 ms |
-| Start to first painted listing, 1,000 entries | < 100 ms | 77.3 ms |
-| Enumeration complete to painted, 10,000 entries | < 50 ms | 21.2 ms |
-| Search update, 10,000 entries | < 50 ms | 2.5 ms |
-| Release binary size | - | 915,456 bytes |
+| Measure | Budget | Before (`d0a25f1`) | After | Change |
+|---|---|---|---|---|
+| Config load (starter config) | < 10 ms | 0.6 ms | 0.6 ms | none |
+| Start to first painted listing, 1,000 entries | < 100 ms | 65.7 / 63.7 ms | 60.4 / 62.5 ms | -5 % |
+| Enumeration complete to painted, 10,000 entries | < 50 ms | 21.4 / 21.4 ms | 19.5 / 20.1 ms | -7 % |
+| Search update, 10,000 entries | < 50 ms | 2.5 / 2.4 ms | 1.5 / 1.5 ms | -39 % |
+| Release binary size | - | 915,456 bytes | 936,960 bytes | +2.3 % |
+
+Initial baseline of task 1.4 (taken alone, before the work): config load 0.8 ms, first painted listing 77.3 ms, 10,000 entries painted 21.2 ms, search update 2.5 ms.
+
+All budgets are met and no measure is worse than before. The search update gained from selection changes no longer refreshing the status bar per item and from the cached highlight brush.
