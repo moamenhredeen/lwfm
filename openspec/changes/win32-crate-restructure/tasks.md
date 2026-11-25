@@ -43,10 +43,10 @@ Every group ends green (`cargo clippy --all-targets -- -D warnings`, `cargo fmt 
 
 ## 6. Application structure
 
-- [ ] 6.1 Split `src/app.rs` into `src/app/{mod,list,keys,nav,search,config,commands,status}.rs` without changing logic; verify `cargo test` passes and no file under `src/app/` exceeds 400 lines
-- [ ] 6.2 Group the fields into `ConfigState`, `KeySeq`, `Listing`, `SearchState`, `RebuildTimer` and `TraceState` (design D11) and document the borrow rule on `Listing` and `SearchState`; add the `debug_assert!` next to the `try_borrow` fallbacks; verify a debug build runs through navigation, sort, toggle-hidden, search and config reload without an assertion
-- [ ] 6.3 Replace `load`, `loading`, `loaded` and `committed` with `LoadState`; verify the navigation and directory-listing scenarios manually: slow path keeps the old listing until the first batch, failed start argument falls back to home with a message, refresh keeps selection and search
-- [ ] 6.4 Pass `Startup` by value and remove the `config::defaults()` placeholder from `App::new`; verify with `LWFM_TRACE=1` that the config is loaded once per start; commit
+- [x] 6.1 Split `src/app.rs` into `src/app/{mod,list,keys,nav,search,config,commands,status}.rs` without changing logic; verify `cargo test` passes and no file under `src/app/` exceeds 400 lines
+- [x] 6.2 Group the fields into `ConfigState`, `KeySeq`, `Listing`, `SearchState`, `RebuildTimer` and `TraceState` (design D11) and document the borrow rule on `Listing` and `SearchState`; add the `debug_assert!` next to the `try_borrow` fallbacks; verify a debug build runs through navigation, sort, toggle-hidden, search and config reload without an assertion
+- [x] 6.3 Replace `load`, `loading`, `loaded` and `committed` with `LoadState`; verify the navigation and directory-listing scenarios manually: slow path keeps the old listing until the first batch, failed start argument falls back to home with a message, refresh keeps selection and search
+- [x] 6.4 Pass `Startup` by value and remove the `config::defaults()` placeholder from `App::new`; verify with `LWFM_TRACE=1` that the config is loaded once per start; commit
 
 ## 7. Errors and idioms
 
