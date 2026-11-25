@@ -8,14 +8,20 @@
 #![deny(clippy::multiple_unsafe_ops_per_block)]
 
 mod error;
+mod gdi;
+mod geom;
 mod handle;
+mod msg;
 mod num;
 mod wide;
 
+pub mod controls;
 pub mod fs;
+pub mod input;
 pub mod process;
 pub mod sys;
 pub mod text;
 pub mod window;
 
 pub use error::{Error, ErrorKind};
+pub use geom::{Color, Dpi, Rect, Size};

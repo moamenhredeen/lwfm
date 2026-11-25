@@ -20,6 +20,16 @@ pub(crate) fn ticks_i64(high: u32, low: u32) -> i64 {
     i64::from_ne_bytes(join_u64(high, low).to_ne_bytes())
 }
 
+/// The low 16 bits of a message parameter.
+pub(crate) fn loword(value: usize) -> u16 {
+    u16::try_from(value & 0xFFFF).unwrap_or(0)
+}
+
+/// Bits 16 to 31 of a message parameter.
+pub(crate) fn hiword(value: usize) -> u16 {
+    loword(value >> 16)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -29,5 +39,6 @@ mod tests {
         assert_eq!(join_u64(1, 2), 0x1_0000_0002);
         assert_eq!(ticks_i64(0, 5), 5);
         assert_eq!(ticks_i64(0x01DC_0000, 0), 0x01DC_0000_0000_0000);
+        assert_eq!((loword(0x1234_5678), hiword(0x1234_5678)), (0x5678, 0x1234));
     }
 }
